@@ -1,7 +1,9 @@
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
 use anyhow::{Result, bail};
-use papagaia_core::{ClientRequest, ClientResponse, Config, OverlayMessage, PromptConfig};
+use papagaia_core::{
+    ClientRequest, ClientResponse, Config, OverlayMessage, PromptConfig, validate_prompt_options,
+};
 use tokio::{
     sync::{Mutex, mpsc},
     time::{Duration, sleep},
@@ -62,9 +64,19 @@ impl App {
                 template,
                 selected_text,
                 preserve_selection,
+                strip_markdown_fences,
+                trim_whitespace,
+                stream_output,
             } => {
-                self.transform_raw(&template, selected_text, preserve_selection)
-                    .await
+                self.transform_raw(
+                    &template,
+                    selected_text,
+                    preserve_selection,
+                    strip_markdown_fences,
+                    trim_whitespace,
+                    stream_output,
+                )
+                .await
             }
             ClientRequest::DictateStart => self.dictate_start().await,
             ClientRequest::DictateStop => self.dictate_stop().await,
@@ -116,10 +128,12 @@ impl App {
         preserve_selection: bool,
         cancel: &CancelToken,
     ) -> Result<(String, bool)> {
+        let label = format!("Running {prompt_name}");
+
         // Capture phase: wtype needs the original window focused — no grab.
         self.overlay
             .send(OverlayMessage::Busy {
-                label: format!("Running {prompt_name}"),
+                label: label.clone(),
                 grab_keyboard: false,
             })
             .await;
@@ -135,15 +149,48 @@ impl App {
         )
         .await?;
 
+        // Engine phase: non-streaming prompts can grab the keyboard so Esc
+        // cancels the engine. Streaming prompts must keep focus in the target
+        // window because output is typed there incrementally.
+        self.overlay
+            .send(OverlayMessage::Busy {
+                label: label.clone(),
+                grab_keyboard: !prompt.stream_output,
+            })
+            .await;
+
         let engine = config.engine().clone();
         let rendered_prompt = match &selected {
             Some(text) => prompt.render(text),
             None => prompt.template.clone(),
         };
-        let raw = llm::run_engine(&engine, &rendered_prompt, cancel).await?;
-        let cleaned = prompt.clean_output(&raw);
+        let cleaned = if prompt.stream_output {
+            stream_prompt_output(
+                &self.overlay,
+                &config.tools,
+                &prompt,
+                &engine,
+                &rendered_prompt,
+                cancel,
+            )
+            .await?
+        } else {
+            let raw = llm::run_engine(&engine, &rendered_prompt, cancel).await?;
+            let cleaned = prompt.clean_output(&raw);
 
-        clipboard::paste_text(&config.tools, &cleaned, cancel).await?;
+            // Paste phase: release the grab so focus returns to the target window
+            // before wtype fires the paste shortcut.
+            self.overlay
+                .send(OverlayMessage::Busy {
+                    label,
+                    grab_keyboard: false,
+                })
+                .await;
+            sleep(Duration::from_millis(80)).await;
+
+            clipboard::paste_text(&config.tools, &cleaned, cancel).await?;
+            cleaned
+        };
         Ok((cleaned, selected.is_some()))
     }
 
@@ -152,6 +199,9 @@ impl App {
         template: &str,
         selected_text: Option<String>,
         preserve_selection: bool,
+        strip_markdown_fences: bool,
+        trim_whitespace: bool,
+        stream_output: bool,
     ) -> Result<ClientResponse> {
         let cancel = self.enter_busy("running ad-hoc prompt".into()).await?;
         let outcome = self
@@ -159,6 +209,9 @@ impl App {
                 template,
                 selected_text.as_deref(),
                 preserve_selection,
+                strip_markdown_fences,
+                trim_whitespace,
+                stream_output,
                 &cancel,
             )
             .await;
@@ -186,8 +239,12 @@ impl App {
         template: &str,
         selected_text: Option<&str>,
         preserve_selection: bool,
+        strip_markdown_fences: bool,
+        trim_whitespace: bool,
+        stream_output: bool,
         cancel: &CancelToken,
     ) -> Result<(String, bool)> {
+        // Capture phase: wtype needs the original window focused — no grab.
         self.overlay
             .send(OverlayMessage::Busy {
                 label: "Running prompt".into(),
@@ -208,18 +265,54 @@ impl App {
         let prompt = PromptConfig {
             name: "ad-hoc".into(),
             template: template.into(),
-            strip_markdown_fences: true,
-            trim_whitespace: true,
+            strip_markdown_fences,
+            trim_whitespace,
+            stream_output,
         };
+        validate_prompt_options(&prompt)?;
+
+        // Engine phase: non-streaming prompts can grab the keyboard so Esc
+        // cancels the engine. Streaming prompts must keep focus in the target
+        // window because output is typed there incrementally.
+        self.overlay
+            .send(OverlayMessage::Busy {
+                label: "Running prompt".into(),
+                grab_keyboard: !prompt.stream_output,
+            })
+            .await;
+
         let engine = config.engine().clone();
         let rendered_prompt = match &selected {
             Some(text) => prompt.render(text),
             None => template.to_string(),
         };
-        let raw = llm::run_engine(&engine, &rendered_prompt, cancel).await?;
-        let cleaned = prompt.clean_output(&raw);
+        let cleaned = if prompt.stream_output {
+            stream_prompt_output(
+                &self.overlay,
+                &config.tools,
+                &prompt,
+                &engine,
+                &rendered_prompt,
+                cancel,
+            )
+            .await?
+        } else {
+            let raw = llm::run_engine(&engine, &rendered_prompt, cancel).await?;
+            let cleaned = prompt.clean_output(&raw);
 
-        clipboard::paste_text(&config.tools, &cleaned, cancel).await?;
+            // Paste phase: release the grab so focus returns to the target window
+            // before wtype fires the paste shortcut.
+            self.overlay
+                .send(OverlayMessage::Busy {
+                    label: "Running prompt".into(),
+                    grab_keyboard: false,
+                })
+                .await;
+            sleep(Duration::from_millis(80)).await;
+
+            clipboard::paste_text(&config.tools, &cleaned, cancel).await?;
+            cleaned
+        };
         Ok((cleaned, selected.is_some()))
     }
 
@@ -275,15 +368,17 @@ impl App {
             }
         };
 
-        // Transcribe phase: whisper reads the WAV file, no foreign focus needed.
+        // Transcribe phase: whisper reads the WAV file, no foreign focus needed,
+        // so grab the keyboard exclusively to let the user press Esc to cancel.
         self.overlay
             .send(OverlayMessage::Busy {
                 label: "Transcribing".into(),
-                grab_keyboard: false,
+                grab_keyboard: true,
             })
             .await;
 
         let config = self.config();
+        let overlay = self.overlay.clone();
         let outcome = async {
             let audio_path = recorder.finish()?;
             let transcript = llm::run_whisper(&config.whisper, &audio_path, &cancel).await?;
@@ -291,6 +386,16 @@ impl App {
             if cleaned.is_empty() {
                 bail!("whisper returned an empty transcript");
             }
+
+            // Type phase: release the grab so focus returns to the target
+            // window before wtype types the transcript into it.
+            overlay
+                .send(OverlayMessage::Busy {
+                    label: "Transcribing".into(),
+                    grab_keyboard: false,
+                })
+                .await;
+            sleep(Duration::from_millis(80)).await;
 
             clipboard::type_text(&config.tools, &cleaned, &cancel).await?;
             std::fs::remove_file(&audio_path).ok();
@@ -397,6 +502,256 @@ fn template_needs_selection(template: &str) -> bool {
     template.contains("{{text}}") || template.contains("{{selection}}")
 }
 
+async fn stream_prompt_output(
+    overlay: &OverlayHandle,
+    tools: &papagaia_core::ToolConfig,
+    prompt: &PromptConfig,
+    engine: &papagaia_core::EngineConfig,
+    rendered_prompt: &str,
+    cancel: &CancelToken,
+) -> Result<String> {
+    let state = Arc::new(StdMutex::new(StreamOutputState::new(
+        prompt.trim_whitespace,
+    )));
+    let overlay_for_tail = overlay.clone();
+    let overlay_for_chunks = overlay.clone();
+    let tools_for_tail = tools.clone();
+    let cancel_for_tail = cancel.clone();
+    let callback_tools = tools.clone();
+    let callback_cancel = cancel.clone();
+    let callback_state = state.clone();
+    let streaming_started = Arc::new(StdMutex::new(false));
+    let callback_started = streaming_started.clone();
+
+    llm::run_engine_streaming(engine, rendered_prompt, &cancel_for_tail, move |chunk| {
+        let overlay = overlay_for_chunks.clone();
+        let tools = callback_tools.clone();
+        let cancel = callback_cancel.clone();
+        let callback_state = callback_state.clone();
+        let callback_started = callback_started.clone();
+        async move {
+            let flushed = {
+                let mut state = callback_state
+                    .lock()
+                    .expect("streaming output state lock poisoned");
+                state.push(&chunk)
+            };
+            if !flushed.is_empty() {
+                let should_hide = {
+                    let mut started = callback_started
+                        .lock()
+                        .expect("streaming started lock poisoned");
+                    if *started {
+                        false
+                    } else {
+                        *started = true;
+                        true
+                    }
+                };
+                if should_hide {
+                    overlay.send(OverlayMessage::Hidden).await;
+                    sleep(Duration::from_millis(80)).await;
+                }
+                clipboard::type_text(&tools, &flushed, &cancel).await?;
+                sleep(Duration::from_millis(28)).await;
+            }
+            Ok(())
+        }
+    })
+    .await?;
+
+    let (tail, emitted) = {
+        let mut state = state.lock().expect("streaming output state lock poisoned");
+        let tail = state.finish();
+        let emitted = state.emitted.clone();
+        (tail, emitted)
+    };
+
+    if !tail.is_empty() {
+        let should_hide = {
+            let mut started = streaming_started
+                .lock()
+                .expect("streaming started lock poisoned");
+            if *started {
+                false
+            } else {
+                *started = true;
+                true
+            }
+        };
+        if should_hide {
+            overlay_for_tail.send(OverlayMessage::Hidden).await;
+            sleep(Duration::from_millis(80)).await;
+        }
+        clipboard::type_text(&tools_for_tail, &tail, &cancel_for_tail).await?;
+    }
+
+    Ok(emitted)
+}
+
+struct StreamOutputState {
+    trim_whitespace: bool,
+    saw_non_whitespace: bool,
+    pending_whitespace: String,
+    escape_state: EscapeState,
+    observed_sanitized: String,
+    pending_flush: String,
+    emitted: String,
+}
+
+impl StreamOutputState {
+    fn new(trim_whitespace: bool) -> Self {
+        Self {
+            trim_whitespace,
+            saw_non_whitespace: false,
+            pending_whitespace: String::new(),
+            escape_state: EscapeState::None,
+            observed_sanitized: String::new(),
+            pending_flush: String::new(),
+            emitted: String::new(),
+        }
+    }
+
+    fn push(&mut self, chunk: &str) -> String {
+        let sanitized = self.sanitize_chunk(chunk);
+        let raw_delta = compute_stream_delta(&self.observed_sanitized, &sanitized);
+        if raw_delta.is_empty() {
+            return String::new();
+        }
+        self.observed_sanitized.push_str(&raw_delta);
+
+        let cleaned = if self.trim_whitespace {
+            self.trimmed_chunk(&raw_delta)
+        } else {
+            raw_delta
+        };
+        if cleaned.is_empty() {
+            return String::new();
+        }
+
+        self.emitted.push_str(&cleaned);
+        self.pending_flush.push_str(&cleaned);
+        if self.should_flush() {
+            return std::mem::take(&mut self.pending_flush);
+        }
+
+        String::new()
+    }
+
+    fn finish(&mut self) -> String {
+        self.pending_whitespace.clear();
+        std::mem::take(&mut self.pending_flush)
+    }
+
+    fn trimmed_chunk(&mut self, chunk: &str) -> String {
+        let mut out = String::new();
+
+        for ch in chunk.chars() {
+            if !self.saw_non_whitespace {
+                if ch.is_whitespace() {
+                    continue;
+                }
+                self.saw_non_whitespace = true;
+            }
+
+            if ch.is_whitespace() {
+                self.pending_whitespace.push(ch);
+            } else {
+                if !self.pending_whitespace.is_empty() {
+                    out.push_str(&self.pending_whitespace);
+                    self.pending_whitespace.clear();
+                }
+                out.push(ch);
+            }
+        }
+
+        out
+    }
+
+    fn sanitize_chunk(&mut self, chunk: &str) -> String {
+        let mut out = String::new();
+
+        for ch in chunk.chars() {
+            match self.escape_state {
+                EscapeState::None => {}
+                EscapeState::Started => {
+                    self.escape_state = if ch == '[' {
+                        EscapeState::Csi
+                    } else {
+                        EscapeState::None
+                    };
+                    continue;
+                }
+                EscapeState::Csi => {
+                    if ('@'..='~').contains(&ch) {
+                        self.escape_state = EscapeState::None;
+                    }
+                    continue;
+                }
+            }
+
+            match ch {
+                '\u{1b}' => {
+                    self.escape_state = EscapeState::Started;
+                }
+                '\r' => {}
+                '\u{8}' | '\u{7f}' => {
+                    out.pop();
+                }
+                _ if ch.is_control() && ch != '\n' && ch != '\t' => {}
+                _ => out.push(ch),
+            }
+        }
+
+        out
+    }
+
+    fn should_flush(&self) -> bool {
+        self.pending_flush.contains('\n')
+            || self.pending_flush.len() >= 64
+            || (self.pending_flush.len() >= 24
+                && self
+                    .pending_flush
+                    .chars()
+                    .last()
+                    .is_some_and(|ch| ch.is_whitespace() || ",.;:!?)]}".contains(ch)))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EscapeState {
+    None,
+    Started,
+    Csi,
+}
+
+fn compute_stream_delta(emitted: &str, chunk: &str) -> String {
+    if chunk.is_empty() {
+        return String::new();
+    }
+    if emitted.is_empty() {
+        return chunk.to_string();
+    }
+    if emitted.starts_with(chunk) || emitted.ends_with(chunk) {
+        return String::new();
+    }
+    if let Some(rest) = chunk.strip_prefix(emitted) {
+        return rest.to_string();
+    }
+
+    let mut overlap = 0;
+    for (idx, _) in chunk.char_indices().skip(1) {
+        if emitted.ends_with(&chunk[..idx]) {
+            overlap = idx;
+        }
+    }
+    if emitted.ends_with(chunk) {
+        overlap = chunk.len();
+    }
+
+    chunk[overlap..].to_string()
+}
+
 async fn resolve_selected_text(
     tools: &papagaia_core::ToolConfig,
     template: &str,
@@ -418,5 +773,213 @@ async fn resolve_selected_text(
         Ok(text) => Ok(Some(text)),
         Err(_) if !needs_selection => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use papagaia_core::{EngineConfig, PromptConfig, ToolConfig};
+
+    use crate::{cancel::CancelToken, overlay::OverlayHandle};
+
+    use super::{StreamOutputState, compute_stream_delta, stream_prompt_output};
+
+    #[test]
+    fn streaming_trim_drops_outer_whitespace() {
+        let mut state = StreamOutputState::new(true);
+
+        assert_eq!(state.push("  hello"), "");
+        assert_eq!(state.push(" world  "), "");
+        assert_eq!(state.finish(), "hello world");
+        assert_eq!(state.emitted, "hello world");
+    }
+
+    #[test]
+    fn streaming_without_trim_preserves_whitespace() {
+        let mut state = StreamOutputState::new(false);
+
+        assert_eq!(state.push(" hi"), "");
+        assert_eq!(state.push(" there "), "");
+        assert_eq!(state.finish(), " hi there ");
+        assert_eq!(state.emitted, " hi there ");
+    }
+
+    #[test]
+    fn compute_stream_delta_handles_cumulative_chunks() {
+        assert_eq!(compute_stream_delta("h", "he"), "e");
+        assert_eq!(compute_stream_delta("hello", "hello world"), " world");
+    }
+
+    #[test]
+    fn compute_stream_delta_handles_overlapping_chunks() {
+        assert_eq!(compute_stream_delta("hello", "lo world"), " world");
+        assert_eq!(compute_stream_delta("hello world", "world"), "");
+    }
+
+    #[test]
+    fn streaming_state_strips_ansi_sequences() {
+        let mut state = StreamOutputState::new(false);
+        assert_eq!(state.push("\u{1b}[2Khello"), "");
+        assert_eq!(state.finish(), "hello");
+    }
+
+    #[tokio::test]
+    async fn stream_prompt_output_types_exact_delta_once() {
+        let dir = make_test_dir("stream-delta");
+        let type_script = dir.join("type.sh");
+        let engine_script = dir.join("engine.sh");
+        let out_path = dir.join("typed.txt");
+        fs::write(&out_path, "").expect("output file should be created");
+
+        write_executable(
+            &type_script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s' "$2" >> "$1"
+"#,
+        );
+        write_executable(
+            &engine_script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '\033[2K'
+printf 'The quick '
+sleep 0.05
+printf 'The quick brown '
+sleep 0.05
+printf 'own fox'
+"#,
+        );
+
+        let tools = fake_tools(&type_script, &out_path);
+        let prompt = PromptConfig {
+            name: "test".into(),
+            template: "{{text}}".into(),
+            strip_markdown_fences: false,
+            trim_whitespace: true,
+            stream_output: true,
+        };
+        let engine = EngineConfig {
+            argv: vec![engine_script.display().to_string()],
+            stdin: false,
+            capture_stdout: true,
+        };
+
+        let overlay = OverlayHandle::spawn(false).expect("overlay should be disabled in tests");
+        let emitted = stream_prompt_output(
+            &overlay,
+            &tools,
+            &prompt,
+            &engine,
+            "ignored",
+            &CancelToken::new(),
+        )
+        .await
+        .expect("streaming should succeed");
+        let typed = fs::read_to_string(&out_path).expect("typed output should exist");
+
+        assert_eq!(emitted, "The quick brown fox");
+        assert_eq!(typed, "The quick brown fox");
+    }
+
+    #[tokio::test]
+    async fn stream_prompt_output_handles_backspace_and_overlap() {
+        let dir = make_test_dir("stream-backspace");
+        let type_script = dir.join("type.sh");
+        let engine_script = dir.join("engine.sh");
+        let out_path = dir.join("typed.txt");
+        fs::write(&out_path, "").expect("output file should be created");
+
+        write_executable(
+            &type_script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s' "$2" >> "$1"
+"#,
+        );
+        write_executable(
+            &engine_script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf 'hel'
+sleep 0.05
+printf 'hello '
+sleep 0.05
+printf 'o worl'
+sleep 0.05
+printf 'world!\b!'
+"#,
+        );
+
+        let tools = fake_tools(&type_script, &out_path);
+        let prompt = PromptConfig {
+            name: "test".into(),
+            template: "{{text}}".into(),
+            strip_markdown_fences: false,
+            trim_whitespace: false,
+            stream_output: true,
+        };
+        let engine = EngineConfig {
+            argv: vec![engine_script.display().to_string()],
+            stdin: false,
+            capture_stdout: true,
+        };
+
+        let overlay = OverlayHandle::spawn(false).expect("overlay should be disabled in tests");
+        let emitted = stream_prompt_output(
+            &overlay,
+            &tools,
+            &prompt,
+            &engine,
+            "ignored",
+            &CancelToken::new(),
+        )
+        .await
+        .expect("streaming should succeed");
+        let typed = fs::read_to_string(&out_path).expect("typed output should exist");
+
+        assert_eq!(emitted, "hello world!");
+        assert_eq!(typed, "hello world!");
+    }
+
+    fn fake_tools(type_script: &Path, out_path: &Path) -> ToolConfig {
+        ToolConfig {
+            read_clipboard_command: vec!["true".into()],
+            write_clipboard_command: vec!["true".into()],
+            copy_command: vec!["true".into()],
+            paste_command: vec!["true".into()],
+            type_command: vec![
+                type_script.display().to_string(),
+                out_path.display().to_string(),
+                "{{text}}".into(),
+            ],
+            clipboard_settle_ms: 0,
+        }
+    }
+
+    fn make_test_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic enough for tests")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("papagaia-{label}-{nonce}"));
+        fs::create_dir_all(&dir).expect("test dir should be created");
+        dir
+    }
+
+    fn write_executable(path: &Path, script: &str) {
+        fs::write(path, script).expect("script should be written");
+        let mut perms = fs::metadata(path)
+            .expect("script metadata should exist")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("script should be executable");
     }
 }

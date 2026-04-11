@@ -33,6 +33,8 @@ pub fn install() -> Result<PathBuf> {
     run_systemctl(&["daemon-reload"])?;
     run_systemctl(&["enable", "--now", UNIT_NAME])?;
 
+    restart()?;
+
     Ok(unit_path)
 }
 

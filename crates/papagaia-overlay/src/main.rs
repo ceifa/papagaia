@@ -31,8 +31,15 @@ struct PickerEntry {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum PickerResult {
-    Template { name: String },
-    Raw { template: String },
+    Template {
+        name: String,
+    },
+    Raw {
+        template: String,
+        strip_markdown_fences: bool,
+        trim_whitespace: bool,
+        stream_output: bool,
+    },
 }
 
 const BRAILLE_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -303,10 +310,24 @@ fn picker_resolve(
 
     let text = input.text().to_string();
     if !text.is_empty() {
-        return Some(PickerResult::Raw { template: text });
+        return parse_picker_raw(&text);
     }
 
     None
+}
+
+fn parse_picker_raw(text: &str) -> Option<PickerResult> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    Some(PickerResult::Raw {
+        template: text.to_string(),
+        strip_markdown_fences: false,
+        trim_whitespace: true,
+        stream_output: true,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -726,4 +747,28 @@ fn install_css() {
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PickerResult, parse_picker_raw};
+
+    #[test]
+    fn plain_picker_text_uses_streaming_raw_defaults() {
+        let result = parse_picker_raw("Fix this: {{text}}").expect("picker should resolve");
+        match result {
+            PickerResult::Raw {
+                template,
+                strip_markdown_fences,
+                trim_whitespace,
+                stream_output,
+            } => {
+                assert_eq!(template, "Fix this: {{text}}");
+                assert!(!strip_markdown_fences);
+                assert!(trim_whitespace);
+                assert!(stream_output);
+            }
+            PickerResult::Template { .. } => panic!("expected raw picker result"),
+        }
+    }
 }

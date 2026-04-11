@@ -17,11 +17,21 @@ pub enum ClientRequest {
         selected_text: Option<String>,
         #[serde(default)]
         preserve_selection: bool,
+        #[serde(default = "default_true")]
+        strip_markdown_fences: bool,
+        #[serde(default = "default_true")]
+        trim_whitespace: bool,
+        #[serde(default)]
+        stream_output: bool,
     },
     DictateStart,
     DictateStop,
     DictateToggle,
     Cancel,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

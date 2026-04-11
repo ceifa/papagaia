@@ -1,7 +1,9 @@
+use std::future::Future;
+
 use anyhow::{Context, Result, bail};
 use papagaia_core::ToolConfig;
 use tokio::{
-    io::AsyncRead,
+    io::{AsyncRead, AsyncReadExt},
     process::{Child, Command},
     time::{Duration, sleep},
 };
@@ -90,6 +92,103 @@ pub async fn run_command(
     })
 }
 
+pub async fn run_command_streaming<F, Fut>(
+    argv: &[String],
+    stdin_text: Option<&str>,
+    cancel: &CancelToken,
+    mut on_stdout: F,
+) -> Result<std::process::Output>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    if cancel.is_cancelled() {
+        bail!("operation cancelled");
+    }
+
+    let Some(program) = argv.first() else {
+        bail!("cannot run an empty command");
+    };
+
+    let mut command = Command::new(program);
+    command.args(&argv[1..]);
+
+    if stdin_text.is_some() {
+        command.stdin(std::process::Stdio::piped());
+    }
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    command.kill_on_drop(true);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", argv.join(" ")))?;
+
+    if let Some(text) = stdin_text {
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(text.as_bytes()).await?;
+        }
+    }
+
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let mut stdout_bytes = Vec::new();
+    let mut pending_utf8 = Vec::new();
+    let mut exit_status = None;
+
+    while exit_status.is_none() {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("failed to poll {}", argv.join(" ")))?
+        {
+            exit_status = Some(status);
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                bail!("operation cancelled");
+            }
+            read = read_stdout_chunk(&mut stdout, &mut stdout_bytes, &mut pending_utf8, &mut on_stdout) => {
+                read?;
+            }
+            _ = sleep(Duration::from_millis(40)) => {}
+        }
+    }
+
+    if exit_status.is_some() {
+        drain_streaming_stdout(
+            &mut stdout,
+            &mut stdout_bytes,
+            &mut pending_utf8,
+            &mut on_stdout,
+        )
+        .await?;
+    }
+
+    if !pending_utf8.is_empty() {
+        bail!("command produced invalid UTF-8 on stdout");
+    }
+
+    let status = exit_status.expect("exit status must be set before draining stdout");
+    let stderr = drain_pipe(&mut stderr).await;
+
+    if !status.success() {
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        bail!("{}", command_failure(argv, stderr_text.trim()));
+    }
+
+    Ok(std::process::Output {
+        status,
+        stdout: stdout_bytes,
+        stderr,
+    })
+}
+
 /// Wait for the child to exit, killing it if the cancel token fires.
 ///
 /// We can't use `tokio::select! { _ = child.wait() => .., _ = cancel.cancelled() => child.start_kill() }`
@@ -143,6 +242,100 @@ async fn drain_pipe<R: AsyncRead + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
     {
         Ok(Ok(_)) | Ok(Err(_)) => buf,
         Err(_) => buf, // timeout — return what we have
+    }
+}
+
+async fn read_stdout_chunk<F, Fut>(
+    child_stdout: &mut Option<tokio::process::ChildStdout>,
+    stdout_bytes: &mut Vec<u8>,
+    pending_utf8: &mut Vec<u8>,
+    on_stdout: &mut F,
+) -> Result<()>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let Some(stdout) = child_stdout.as_mut() else {
+        sleep(Duration::from_millis(40)).await;
+        return Ok(());
+    };
+
+    let mut buf = [0_u8; 1024];
+    match stdout.read(&mut buf).await {
+        Ok(0) => {
+            *child_stdout = None;
+            Ok(())
+        }
+        Ok(read) => {
+            stdout_bytes.extend_from_slice(&buf[..read]);
+            pending_utf8.extend_from_slice(&buf[..read]);
+            flush_valid_utf8(pending_utf8, on_stdout).await
+        }
+        Err(error) => Err(error).context("failed to read command stdout"),
+    }
+}
+
+async fn drain_streaming_stdout<F, Fut>(
+    stdout: &mut Option<tokio::process::ChildStdout>,
+    stdout_bytes: &mut Vec<u8>,
+    pending_utf8: &mut Vec<u8>,
+    on_stdout: &mut F,
+) -> Result<()>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    while stdout.is_some() {
+        match tokio::time::timeout(
+            Duration::from_millis(200),
+            read_stdout_chunk(stdout, stdout_bytes, pending_utf8, on_stdout),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
+async fn flush_valid_utf8<F, Fut>(pending_utf8: &mut Vec<u8>, on_stdout: &mut F) -> Result<()>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let Some(text) = take_valid_utf8_prefix(pending_utf8)? else {
+        return Ok(());
+    };
+    if text.is_empty() {
+        return Ok(());
+    }
+    on_stdout(text).await
+}
+
+fn take_valid_utf8_prefix(buffer: &mut Vec<u8>) -> Result<Option<String>> {
+    match std::str::from_utf8(buffer) {
+        Ok(text) => {
+            let text = text.to_string();
+            buffer.clear();
+            Ok(Some(text))
+        }
+        Err(error) => {
+            let valid_up_to = error.valid_up_to();
+            if valid_up_to == 0 {
+                if error.error_len().is_none() {
+                    return Ok(None);
+                }
+                bail!("command produced invalid UTF-8 on stdout");
+            }
+
+            let text = std::str::from_utf8(&buffer[..valid_up_to])
+                .expect("valid UTF-8 prefix")
+                .to_string();
+            let rest = buffer[valid_up_to..].to_vec();
+            *buffer = rest;
+            Ok(Some(text))
+        }
     }
 }
 

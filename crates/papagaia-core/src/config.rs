@@ -63,6 +63,7 @@ impl Config {
             if prompt.name.trim().is_empty() {
                 bail!("prompt name cannot be empty");
             }
+            validate_prompt_options(prompt)?;
         }
 
         Ok(())
@@ -165,6 +166,8 @@ pub struct PromptConfig {
     pub strip_markdown_fences: bool,
     #[serde(default = "default_true")]
     pub trim_whitespace: bool,
+    #[serde(default)]
+    pub stream_output: bool,
 }
 
 impl PromptConfig {
@@ -185,6 +188,17 @@ impl PromptConfig {
 
         text
     }
+}
+
+pub fn validate_prompt_options(prompt: &PromptConfig) -> Result<()> {
+    if prompt.stream_output && prompt.strip_markdown_fences {
+        bail!(
+            "prompt '{}' cannot use stream_output with strip_markdown_fences = true",
+            prompt.name
+        );
+    }
+
+    Ok(())
 }
 
 pub fn render_prompt_template(template: &str, selected_text: &str) -> String {
@@ -304,6 +318,8 @@ fn default_whisper_argv() -> Vec<String> {
         "auto".into(),
         "-np".into(),
         "-nt".into(),
+        "--prompt".into(),
+        "Natural spoken dictation with correct punctuation, natural sentences, and no filler words.".into(),
     ]
 }
 
@@ -337,7 +353,10 @@ fn wtype_type_command() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PromptConfig, expand_home, render_prompt_template, strip_outer_markdown_fence};
+    use super::{
+        Config, EngineConfig, OverlayConfig, PromptConfig, ToolConfig, WhisperConfig, expand_home,
+        render_prompt_template, strip_outer_markdown_fence, validate_prompt_options,
+    };
 
     #[test]
     fn strips_outer_markdown_fence() {
@@ -352,6 +371,7 @@ mod tests {
             template: "hello {{text}}".into(),
             strip_markdown_fences: false,
             trim_whitespace: true,
+            stream_output: false,
         };
 
         assert_eq!(prompt.render("world"), "hello world");
@@ -368,5 +388,46 @@ mod tests {
     #[test]
     fn expand_home_keeps_non_home_paths() {
         assert_eq!(expand_home("/tmp/model.bin"), "/tmp/model.bin");
+    }
+
+    #[test]
+    fn config_rejects_streaming_prompt_with_fence_stripping() {
+        let config = Config {
+            tools: ToolConfig::default(),
+            overlay: OverlayConfig::default(),
+            whisper: WhisperConfig::default(),
+            engine: EngineConfig {
+                argv: vec!["engine".into()],
+                stdin: false,
+                capture_stdout: true,
+            },
+            prompts: vec![PromptConfig {
+                name: "streaming".into(),
+                template: "{{text}}".into(),
+                strip_markdown_fences: true,
+                trim_whitespace: true,
+                stream_output: true,
+            }],
+        };
+
+        let error = config.validate().expect_err("config should be invalid");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot use stream_output with strip_markdown_fences = true")
+        );
+    }
+
+    #[test]
+    fn validate_prompt_options_accepts_streaming_without_fence_stripping() {
+        let prompt = PromptConfig {
+            name: "streaming".into(),
+            template: "{{text}}".into(),
+            strip_markdown_fences: false,
+            trim_whitespace: true,
+            stream_output: true,
+        };
+
+        validate_prompt_options(&prompt).expect("prompt should be valid");
     }
 }

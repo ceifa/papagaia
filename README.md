@@ -129,11 +129,51 @@ run an ad-hoc one:
 papagaia prompt list
 papagaia prompt run shorten
 papagaia prompt raw --text 'Refactor this code and return only the final code: {{text}}'
+papagaia prompt raw --text 'Fix grammar and return only the corrected text: {{text}}' --stream-output --strip-markdown-fences false
 printf 'Summarize this in one sentence: {{text}}' | papagaia prompt raw --stdin
 ```
 
 If an ad-hoc prompt does not contain `{{text}}` or `{{selection}}`, `papagaia`
 appends the selected text automatically.
+
+In the picker, typing plain text still runs a normal ad-hoc prompt. To run an
+ad-hoc prompt with streaming from the picker, just type it directly, for
+example:
+
+```text
+Fix grammar and return only the corrected text: {{text}}
+```
+
+## Streaming Output
+
+If you want the model output to be typed into the focused app while it is still
+being generated, enable `stream_output` on that prompt:
+
+```toml
+[[prompts]]
+name = "fix-grammar-live"
+template = """
+Correct grammar, spelling, and punctuation in the following text.
+Return only the corrected text.
+
+{{text}}
+"""
+strip_markdown_fences = false
+trim_whitespace = true
+stream_output = true
+```
+
+With `stream_output = true`, `papagaia` switches from the usual clipboard paste
+path to the configured `type_command` and injects text incrementally as the
+engine prints to stdout.
+
+Notes:
+
+- This works best with CLIs that already flush text progressively, such as `gemini`.
+- Streaming prompts cannot use `strip_markdown_fences = true`, because fence removal needs the full final response.
+- While streaming is active, the overlay does not grab the keyboard; if you want a dedicated cancel shortcut, bind `papagaia cancel` in your compositor.
+- Ad-hoc calls can stream too: `papagaia prompt raw --text '...' --stream-output --strip-markdown-fences false`.
+- Picker ad-hoc text streams by default.
 
 ## Notes
 

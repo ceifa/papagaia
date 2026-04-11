@@ -1,9 +1,14 @@
 use std::path::Path;
 
+use std::future::Future;
+
 use anyhow::{Context, Result, bail};
 use papagaia_core::{EngineConfig, WhisperConfig};
 
-use crate::{cancel::CancelToken, clipboard::run_command};
+use crate::{
+    cancel::CancelToken,
+    clipboard::{run_command, run_command_streaming},
+};
 
 pub async fn run_engine(
     engine: &EngineConfig,
@@ -19,6 +24,36 @@ pub async fn run_engine(
         run_command(&argv, Some(prompt), cancel).await?
     } else {
         run_command(&argv, None, cancel).await?
+    };
+
+    if !engine.capture_stdout {
+        return Ok(String::new());
+    }
+
+    let text =
+        String::from_utf8(output.stdout).context("configured engine produced invalid UTF-8")?;
+    Ok(clean_engine_output(&text))
+}
+
+pub async fn run_engine_streaming<F, Fut>(
+    engine: &EngineConfig,
+    prompt: &str,
+    cancel: &CancelToken,
+    on_stdout: F,
+) -> Result<String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    if engine.argv.is_empty() {
+        bail!("configured engine has no argv configured");
+    }
+
+    let argv = render_argv(&engine.argv, &[("prompt", prompt)]);
+    let output = if engine.stdin {
+        run_command_streaming(&argv, Some(prompt), cancel, on_stdout).await?
+    } else {
+        run_command_streaming(&argv, None, cancel, on_stdout).await?
     };
 
     if !engine.capture_stdout {

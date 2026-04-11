@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use papagaia_core::{ClientRequest, ClientResponse, Config, ToolConfig, expand_home, socket_path};
 
 #[derive(Debug, Parser)]
@@ -70,6 +70,12 @@ struct RawPromptArgs {
     text: Option<String>,
     #[arg(long)]
     stdin: bool,
+    #[arg(long)]
+    stream_output: bool,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    strip_markdown_fences: bool,
+    #[arg(long = "trim-whitespace", default_value_t = true, action = ArgAction::Set)]
+    trim_whitespace: bool,
 }
 
 #[derive(Debug)]
@@ -122,11 +128,14 @@ fn main() -> Result<()> {
                 })?)
             }
             PromptCommands::Raw(args) => {
-                let template = resolve_raw_prompt_text(args)?;
+                let template = resolve_raw_prompt_text(&args)?;
                 print_response(send_request(&ClientRequest::TransformRaw {
                     template,
                     selected_text: None,
                     preserve_selection: false,
+                    strip_markdown_fences: args.strip_markdown_fences,
+                    trim_whitespace: args.trim_whitespace,
+                    stream_output: args.stream_output,
                 })?)
             }
             PromptCommands::Pick => run_pick(),
@@ -170,6 +179,10 @@ fn print_prompt_templates() -> Result<()> {
     println!();
     println!("Run one with:   papagaia prompt run <name>");
     println!("Ad-hoc prompt:  papagaia prompt raw --text 'Rewrite this: {{{{text}}}}'");
+    println!(
+        "Streaming raw:  papagaia prompt raw --text 'Fix this: {{{{text}}}}' --stream-output --strip-markdown-fences false"
+    );
+    println!("Picker raw:     typing ad-hoc text in the picker streams by default");
     Ok(())
 }
 
@@ -251,10 +264,25 @@ fn run_pick() -> Result<()> {
                 .and_then(|t| t.as_str())
                 .context("picker result missing 'template'")?
                 .to_string();
+            let strip_markdown_fences = result
+                .get("strip_markdown_fences")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let trim_whitespace = result
+                .get("trim_whitespace")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let stream_output = result
+                .get("stream_output")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             print_response(send_request(&ClientRequest::TransformRaw {
                 template,
                 selected_text,
                 preserve_selection: true,
+                strip_markdown_fences,
+                trim_whitespace,
+                stream_output,
             })?)
         }
         _ => bail!("unexpected picker result: {stdout}"),
@@ -695,6 +723,8 @@ Return only the rewritten text.
 """
 strip_markdown_fences = true
 trim_whitespace = true
+# Optional: set stream_output = true to type text as the engine prints it.
+# Streaming prompts must keep strip_markdown_fences = false.
 
 [[prompts]]
 name = "fix-grammar"
@@ -856,9 +886,9 @@ fn uses_command(argv: &[String], program: &str) -> bool {
     matches!(argv.first().map(String::as_str), Some(found) if found == program)
 }
 
-fn resolve_raw_prompt_text(args: RawPromptArgs) -> Result<String> {
-    match (args.text, args.stdin) {
-        (Some(text), false) => Ok(text),
+fn resolve_raw_prompt_text(args: &RawPromptArgs) -> Result<String> {
+    match (&args.text, args.stdin) {
+        (Some(text), false) => Ok(text.clone()),
         (None, true) => {
             let mut buffer = String::new();
             io::stdin().read_to_string(&mut buffer)?;
