@@ -7,6 +7,8 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 papagaia-core = { path = "../papagaia-core" }
 glib = "0.20.7"

@@ -1,4 +1,5 @@
 mod app;
+mod cancel;
 mod clipboard;
 mod dictation;
 mod llm;

@@ -36,6 +36,10 @@ pub fn install() -> Result<PathBuf> {
     Ok(unit_path)
 }
 
+pub fn restart() -> Result<()> {
+    run_systemctl(&["restart", UNIT_NAME])
+}
+
 pub fn is_active() -> bool {
     Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", UNIT_NAME])
@@ -78,7 +82,11 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("`systemctl --user {}` failed: {}", args.join(" "), stderr.trim());
+        bail!(
+            "`systemctl --user {}` failed: {}",
+            args.join(" "),
+            stderr.trim()
+        );
     }
     Ok(())
 }

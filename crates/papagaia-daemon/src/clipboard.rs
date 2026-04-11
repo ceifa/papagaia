@@ -1,14 +1,17 @@
 use anyhow::{Context, Result, bail};
 use papagaia_core::ToolConfig;
 use tokio::{
-    process::Command,
+    io::AsyncRead,
+    process::{Child, Command},
     time::{Duration, sleep},
 };
 
-pub async fn capture_selection(tools: &ToolConfig) -> Result<String> {
-    run_command(&tools.copy_command, None).await?;
+use crate::cancel::CancelToken;
+
+pub async fn capture_selection(tools: &ToolConfig, cancel: &CancelToken) -> Result<String> {
+    run_command(&tools.copy_command, None, cancel).await?;
     sleep(Duration::from_millis(tools.clipboard_settle_ms)).await;
-    let output = run_command(&tools.read_clipboard_command, None).await?;
+    let output = run_command(&tools.read_clipboard_command, None, cancel).await?;
     let text = String::from_utf8(output.stdout).context("clipboard data was not valid UTF-8")?;
     if text.trim().is_empty() {
         bail!("clipboard copy produced empty text");
@@ -16,23 +19,28 @@ pub async fn capture_selection(tools: &ToolConfig) -> Result<String> {
     Ok(text)
 }
 
-pub async fn replace_selection(tools: &ToolConfig, text: &str) -> Result<()> {
-    run_command(&tools.write_clipboard_command, Some(text)).await?;
+pub async fn paste_text(tools: &ToolConfig, text: &str, cancel: &CancelToken) -> Result<()> {
+    run_command(&tools.write_clipboard_command, Some(text), cancel).await?;
     sleep(Duration::from_millis(30)).await;
-    run_command(&tools.paste_command, None).await?;
+    run_command(&tools.paste_command, None, cancel).await?;
     Ok(())
 }
 
-pub async fn type_text(tools: &ToolConfig, text: &str) -> Result<()> {
+pub async fn type_text(tools: &ToolConfig, text: &str, cancel: &CancelToken) -> Result<()> {
     let argv = render_text_command(&tools.type_command, text);
-    run_command(&argv, None).await?;
+    run_command(&argv, None, cancel).await?;
     Ok(())
 }
 
 pub async fn run_command(
     argv: &[String],
     stdin_text: Option<&str>,
+    cancel: &CancelToken,
 ) -> Result<std::process::Output> {
+    if cancel.is_cancelled() {
+        bail!("operation cancelled");
+    }
+
     let Some(program) = argv.first() else {
         bail!("cannot run an empty command");
     };
@@ -45,6 +53,7 @@ pub async fn run_command(
     }
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
+    command.kill_on_drop(true);
 
     let mut child = command
         .spawn()
@@ -57,16 +66,84 @@ pub async fn run_command(
         }
     }
 
-    let output = child
-        .wait_with_output()
-        .await
-        .with_context(|| format!("failed to wait for {}", argv.join(" ")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("{}", command_failure(argv, stderr.trim()));
+    // Do not use wait_with_output() — commands like wl-copy fork a background
+    // process that inherits our piped stdout/stderr. wait_with_output waits for
+    // pipe EOF which never arrives while the fork lives, hanging the daemon.
+    // Instead: wait for the child to exit, then drain whatever the pipes hold.
+    let mut child_stdout = child.stdout.take();
+    let mut child_stderr = child.stderr.take();
+
+    let status = wait_or_cancel(&mut child, cancel, argv).await?;
+
+    let stdout = drain_pipe(&mut child_stdout).await;
+    let stderr = drain_pipe(&mut child_stderr).await;
+
+    if !status.success() {
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        bail!("{}", command_failure(argv, stderr_text.trim()));
     }
 
-    Ok(output)
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Wait for the child to exit, killing it if the cancel token fires.
+///
+/// We can't use `tokio::select! { _ = child.wait() => .., _ = cancel.cancelled() => child.start_kill() }`
+/// directly: `child.wait()` holds a `&mut Child` borrow for the duration of
+/// the future, which the borrow checker doesn't release inside the sibling
+/// branch even though tokio drops the loser first. Polling `try_wait()` (a
+/// synchronous probe) sidesteps the borrow entirely — each iteration touches
+/// `child` only between await points.
+async fn wait_or_cancel(
+    child: &mut Child,
+    cancel: &CancelToken,
+    argv: &[String],
+) -> Result<std::process::ExitStatus> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to poll {}", argv.join(" ")));
+            }
+        }
+
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                bail!("operation cancelled");
+            }
+            _ = sleep(Duration::from_millis(40)) => {}
+        }
+    }
+}
+
+/// Read whatever a pipe holds after the child has exited.
+///
+/// For well-behaved commands the pipe closes with the child and this returns
+/// instantly. For commands that fork a background process (e.g. `wl-copy`)
+/// the forked child keeps the pipe open — we give it a short grace window and
+/// then return whatever was already buffered.
+async fn drain_pipe<R: AsyncRead + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
+    let Some(pipe) = pipe.as_mut() else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    match tokio::time::timeout(
+        Duration::from_millis(200),
+        tokio::io::AsyncReadExt::read_to_end(pipe, &mut buf),
+    )
+    .await
+    {
+        Ok(Ok(_)) | Ok(Err(_)) => buf,
+        Err(_) => buf, // timeout — return what we have
+    }
 }
 
 fn render_text_command(argv: &[String], text: &str) -> Vec<String> {

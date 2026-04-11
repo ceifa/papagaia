@@ -4,12 +4,24 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ClientRequest {
     Status,
-    Transform { prompt: String },
-    TransformRaw { template: String },
+    Transform {
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_text: Option<String>,
+        #[serde(default)]
+        preserve_selection: bool,
+    },
+    TransformRaw {
+        template: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_text: Option<String>,
+        #[serde(default)]
+        preserve_selection: bool,
+    },
     DictateStart,
     DictateStop,
     DictateToggle,
-    Reload,
+    Cancel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +64,12 @@ pub enum OverlayMessage {
     Hidden,
     Busy {
         label: String,
+        /// When true, the overlay grabs keyboard focus exclusively so the user
+        /// can press Esc to cancel. Must only be set during phases where the
+        /// daemon is not about to drive a foreign window via wtype/wl-copy
+        /// (those need keyboard focus in the target application, not the HUD).
+        #[serde(default)]
+        grab_keyboard: bool,
     },
     Recording {
         level: f32,

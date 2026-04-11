@@ -3,18 +3,22 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use papagaia_core::{EngineConfig, WhisperConfig};
 
-use crate::clipboard::run_command;
+use crate::{cancel::CancelToken, clipboard::run_command};
 
-pub async fn run_engine(engine: &EngineConfig, prompt: &str) -> Result<String> {
+pub async fn run_engine(
+    engine: &EngineConfig,
+    prompt: &str,
+    cancel: &CancelToken,
+) -> Result<String> {
     if engine.argv.is_empty() {
         bail!("configured engine has no argv configured");
     }
 
     let argv = render_argv(&engine.argv, &[("prompt", prompt)]);
     let output = if engine.stdin {
-        run_command(&argv, Some(prompt)).await?
+        run_command(&argv, Some(prompt), cancel).await?
     } else {
-        run_command(&argv, None).await?
+        run_command(&argv, None, cancel).await?
     };
 
     if !engine.capture_stdout {
@@ -26,7 +30,11 @@ pub async fn run_engine(engine: &EngineConfig, prompt: &str) -> Result<String> {
     Ok(clean_engine_output(&text))
 }
 
-pub async fn run_whisper(whisper: &WhisperConfig, audio_path: &Path) -> Result<String> {
+pub async fn run_whisper(
+    whisper: &WhisperConfig,
+    audio_path: &Path,
+    cancel: &CancelToken,
+) -> Result<String> {
     let audio_path = audio_path
         .to_str()
         .context("audio path contains non-UTF-8 data")?;
@@ -34,7 +42,7 @@ pub async fn run_whisper(whisper: &WhisperConfig, audio_path: &Path) -> Result<S
         &whisper.argv,
         &[("model", &whisper.model), ("audio_path", audio_path)],
     );
-    let output = run_command(&argv, None).await?;
+    let output = run_command(&argv, None, cancel).await?;
     if !whisper.capture_stdout {
         return Ok(String::new());
     }

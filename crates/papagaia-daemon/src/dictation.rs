@@ -82,9 +82,16 @@ impl Recorder {
                 .as_millis()
         ));
 
+        let samples = {
+            let guard = self.samples.lock().expect("recorder sample lock poisoned");
+            guard.clone()
+        };
+
+        let prepared = prepare_for_whisper(&samples, self.channels, self.sample_rate);
+
         let spec = hound::WavSpec {
-            channels: self.channels,
-            sample_rate: self.sample_rate,
+            channels: 1,
+            sample_rate: WHISPER_SAMPLE_RATE,
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
         };
@@ -92,14 +99,63 @@ impl Recorder {
         let mut writer = hound::WavWriter::create(&audio_path, spec)
             .with_context(|| format!("failed to create {}", audio_path.display()))?;
 
-        let samples = self.samples.lock().expect("recorder sample lock poisoned");
-        for sample in samples.iter().copied() {
+        for sample in prepared {
             writer.write_sample(sample)?;
         }
         writer.finalize()?;
 
         Ok(audio_path)
     }
+}
+
+const WHISPER_SAMPLE_RATE: u32 = 16000;
+
+fn prepare_for_whisper(interleaved: &[i16], channels: u16, sample_rate: u32) -> Vec<i16> {
+    let mono = downmix_to_mono(interleaved, channels);
+    let resampled = if sample_rate == WHISPER_SAMPLE_RATE {
+        mono
+    } else {
+        resample(&mono, sample_rate, WHISPER_SAMPLE_RATE)
+    };
+    resampled
+        .into_iter()
+        .map(|sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+        .collect()
+}
+
+fn downmix_to_mono(interleaved: &[i16], channels: u16) -> Vec<f32> {
+    let channels = channels.max(1) as usize;
+    let scale = 1.0 / (i16::MAX as f32 * channels as f32);
+    interleaved
+        .chunks_exact(channels)
+        .map(|frame| frame.iter().map(|sample| *sample as f32).sum::<f32>() * scale)
+        .collect()
+}
+
+// Resamples mono audio using a box-filter kernel. The averaging window acts as
+// a cheap anti-aliasing filter when downsampling, which is the common case
+// (device rates of 44.1/48 kHz down to 16 kHz). For the rare upsampling case
+// the window collapses to a single source sample (nearest neighbour).
+fn resample(samples: &[f32], input_rate: u32, output_rate: u32) -> Vec<f32> {
+    if samples.is_empty() || input_rate == output_rate {
+        return samples.to_vec();
+    }
+
+    let ratio = input_rate as f64 / output_rate as f64;
+    let output_len = ((samples.len() as f64) / ratio).floor() as usize;
+    let mut output = Vec::with_capacity(output_len);
+
+    for i in 0..output_len {
+        let start = (i as f64 * ratio) as usize;
+        let end = (((i + 1) as f64 * ratio) as usize)
+            .max(start + 1)
+            .min(samples.len());
+        let slice = &samples[start..end];
+        let avg = slice.iter().sum::<f32>() / slice.len() as f32;
+        output.push(avg);
+    }
+
+    output
 }
 
 fn push_f32_samples(

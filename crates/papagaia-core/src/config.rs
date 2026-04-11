@@ -300,6 +300,8 @@ fn default_whisper_argv() -> Vec<String> {
         "{{model}}".into(),
         "-f".into(),
         "{{audio_path}}".into(),
+        "-l".into(),
+        "auto".into(),
         "-np".into(),
         "-nt".into(),
     ]

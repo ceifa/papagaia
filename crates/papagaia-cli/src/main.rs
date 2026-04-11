@@ -2,16 +2,17 @@ mod systemd;
 
 use std::{
     fs,
-    io::{self, BufRead, BufReader, Read, Write},
     io::ErrorKind,
+    io::{self, BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use papagaia_core::{ClientRequest, ClientResponse, Config, expand_home, socket_path};
+use papagaia_core::{ClientRequest, ClientResponse, Config, ToolConfig, expand_home, socket_path};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,13 +35,15 @@ enum Commands {
     Init {
         #[arg(long)]
         force: bool,
+        #[arg(long, requires = "force")]
+        no_backup: bool,
     },
     Doctor,
     Dictate {
         #[command(subcommand)]
         command: DictateCommands,
     },
-    Reload,
+    Restart,
     ConfigPath,
 }
 
@@ -50,6 +53,7 @@ enum PromptCommands {
     List,
     Run { name: String },
     Raw(RawPromptArgs),
+    Pick,
 }
 
 #[derive(Debug, Subcommand)]
@@ -111,14 +115,23 @@ fn main() -> Result<()> {
         Commands::Prompt { command } => match command {
             PromptCommands::List => print_prompt_templates(),
             PromptCommands::Run { name } => {
-                print_response(send_request(&ClientRequest::Transform { prompt: name })?)
+                print_response(send_request(&ClientRequest::Transform {
+                    prompt: name,
+                    selected_text: None,
+                    preserve_selection: false,
+                })?)
             }
             PromptCommands::Raw(args) => {
                 let template = resolve_raw_prompt_text(args)?;
-                print_response(send_request(&ClientRequest::TransformRaw { template })?)
+                print_response(send_request(&ClientRequest::TransformRaw {
+                    template,
+                    selected_text: None,
+                    preserve_selection: false,
+                })?)
             }
+            PromptCommands::Pick => run_pick(),
         },
-        Commands::Init { force } => run_init(force),
+        Commands::Init { force, no_backup } => run_init(force, no_backup),
         Commands::Doctor => run_doctor(),
         Commands::Status => print_response(status_request()?),
         Commands::Dictate { command } => match command {
@@ -126,7 +139,7 @@ fn main() -> Result<()> {
             DictateCommands::Stop => print_response(send_request(&ClientRequest::DictateStop)?),
             DictateCommands::Toggle => print_response(send_request(&ClientRequest::DictateToggle)?),
         },
-        Commands::Reload => print_response(send_request(&ClientRequest::Reload)?),
+        Commands::Restart => run_restart(),
     }
 }
 
@@ -137,21 +150,186 @@ fn print_prompt_templates() -> Result<()> {
             "No saved prompts found in {}",
             papagaia_core::config_path()?.display()
         );
+        println!("Add one under [[prompts]] or run `papagaia init` to seed defaults.");
         return Ok(());
     }
 
-    for prompt in &config.prompts {
-        println!("{}", prompt.name);
-        println!("{}", prompt.template.trim());
-        println!();
-    }
+    let name_width = config
+        .prompts
+        .iter()
+        .map(|prompt| prompt.name.chars().count())
+        .max()
+        .unwrap_or(0);
 
-    println!("Run one with: papagaia prompt run <name>");
-    println!("Or use an ad-hoc prompt: papagaia prompt raw --text 'Rewrite this: {{{{text}}}}'");
+    println!("Saved prompts ({}):", config.prompts.len());
+    println!();
+    for prompt in &config.prompts {
+        let summary = prompt_summary(&prompt.template);
+        println!("  {:<width$}  {}", prompt.name, summary, width = name_width);
+    }
+    println!();
+    println!("Run one with:   papagaia prompt run <name>");
+    println!("Ad-hoc prompt:  papagaia prompt raw --text 'Rewrite this: {{{{text}}}}'");
     Ok(())
 }
 
-fn run_init(force: bool) -> Result<()> {
+fn prompt_summary(template: &str) -> String {
+    const MAX_LEN: usize = 72;
+    let first_line = template
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+
+    if first_line.chars().count() <= MAX_LEN {
+        return first_line.to_string();
+    }
+
+    let truncated: String = first_line.chars().take(MAX_LEN - 1).collect();
+    format!("{truncated}…")
+}
+
+fn run_pick() -> Result<()> {
+    let config = Config::load()?;
+    let selected_text = capture_selection_snapshot(&config.tools);
+    let entries: Vec<serde_json::Value> = config
+        .prompts
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "name": p.name,
+                "summary": prompt_summary(&p.template),
+            })
+        })
+        .collect();
+    let entries_json = serde_json::to_string(&entries)?;
+
+    let overlay = overlay_program();
+    let mut child = std::process::Command::new(&overlay)
+        .arg("--pick")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to launch picker at {}", overlay.display()))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(entries_json.as_bytes())?;
+    }
+
+    let output = child.wait_with_output().context("picker process failed")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout.trim();
+
+    if stdout.is_empty() {
+        return Ok(());
+    }
+
+    // Give the compositor a moment to return focus to the previous window
+    // before the daemon eventually pastes the transformed output.
+    thread::sleep(Duration::from_millis(80));
+
+    let result: serde_json::Value =
+        serde_json::from_str(stdout).context("failed to parse picker result")?;
+
+    match result.get("type").and_then(|t| t.as_str()) {
+        Some("template") => {
+            let name = result
+                .get("name")
+                .and_then(|n| n.as_str())
+                .context("picker result missing 'name'")?
+                .to_string();
+            print_response(send_request(&ClientRequest::Transform {
+                prompt: name,
+                selected_text,
+                preserve_selection: true,
+            })?)
+        }
+        Some("raw") => {
+            let template = result
+                .get("template")
+                .and_then(|t| t.as_str())
+                .context("picker result missing 'template'")?
+                .to_string();
+            print_response(send_request(&ClientRequest::TransformRaw {
+                template,
+                selected_text,
+                preserve_selection: true,
+            })?)
+        }
+        _ => bail!("unexpected picker result: {stdout}"),
+    }
+}
+
+fn capture_selection_snapshot(tools: &ToolConfig) -> Option<String> {
+    run_tool(&tools.copy_command, None).ok()?;
+    thread::sleep(Duration::from_millis(tools.clipboard_settle_ms));
+    let output = run_tool(&tools.read_clipboard_command, None).ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
+fn run_tool(argv: &[String], stdin_text: Option<&str>) -> Result<std::process::Output> {
+    let Some(program) = argv.first() else {
+        bail!("cannot run an empty command");
+    };
+
+    let mut command = std::process::Command::new(program);
+    command.args(&argv[1..]);
+    if stdin_text.is_some() {
+        command.stdin(std::process::Stdio::piped());
+    }
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", argv.join(" ")))?;
+
+    if let Some(text) = stdin_text {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to wait for {}", argv.join(" ")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let details = stderr.trim();
+        if details.is_empty() {
+            bail!("command failed: {}", argv.join(" "));
+        }
+        bail!("command failed: {}: {details}", argv.join(" "));
+    }
+
+    Ok(output)
+}
+
+fn overlay_program() -> PathBuf {
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            let sibling = parent.join("papagaia-overlay");
+            if sibling.exists() {
+                return sibling;
+            }
+        }
+    }
+    PathBuf::from("papagaia-overlay")
+}
+
+fn run_restart() -> Result<()> {
+    systemd::restart()?;
+    println!("daemon restarted");
+    Ok(())
+}
+
+fn run_init(force: bool, no_backup: bool) -> Result<()> {
     let config_path = papagaia_core::config_path()?;
     let environment = detect_environment();
     let config_text = render_init_config(&environment);
@@ -169,15 +347,17 @@ fn run_init(force: bool) -> Result<()> {
             );
         }
 
-        let backup = config_backup_path(&config_path)?;
-        fs::copy(&config_path, &backup).with_context(|| {
-            format!(
-                "failed to create config backup from {} to {}",
-                config_path.display(),
-                backup.display()
-            )
-        })?;
-        println!("Backed up existing config to {}", backup.display());
+        if !no_backup {
+            let backup = config_backup_path(&config_path)?;
+            fs::copy(&config_path, &backup).with_context(|| {
+                format!(
+                    "failed to create config backup from {} to {}",
+                    config_path.display(),
+                    backup.display()
+                )
+            })?;
+            println!("Backed up existing config to {}", backup.display());
+        }
     }
 
     fs::write(&config_path, config_text)
@@ -468,7 +648,7 @@ fn render_init_config(environment: &DetectedEnvironment) -> String {
         .whisper_model
         .as_ref()
         .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "~/.local/share/whisper-models/ggml-medium.bin".into());
+        .unwrap_or_else(|| "~/.local/share/whisper-models/ggml-base.bin".into());
     let (copy_command, paste_command, type_command) = preferred_input_commands(environment);
     let engine_command = environment
         .engine_choices
@@ -497,7 +677,7 @@ enabled = true
 
 [whisper]
 model = "{whisper_model}"
-argv = ["whisper-cli", "-m", "{{{{model}}}}", "-f", "{{{{audio_path}}}}", "-np", "-nt"]
+argv = ["whisper-cli", "-m", "{{{{model}}}}", "-f", "{{{{audio_path}}}}", "-np", "-nt", "-l", "auto"]
 capture_stdout = true
 
 {engine_comment}[engine]
@@ -549,13 +729,6 @@ fn preferred_input_commands(environment: &DetectedEnvironment) -> (String, Strin
 fn detect_engine_choices() -> Vec<EngineChoice> {
     let mut choices = Vec::new();
 
-    if command_exists("gemini") {
-        choices.push(EngineChoice {
-            name: "gemini",
-            argv: vec!["gemini".into(), "-p".into(), "{{prompt}}".into()],
-        });
-    }
-
     if command_exists("codex") {
         choices.push(EngineChoice {
             name: "codex",
@@ -586,6 +759,13 @@ fn detect_engine_choices() -> Vec<EngineChoice> {
         choices.push(EngineChoice {
             name: "llama.cpp",
             argv: vec!["llama-cli".into(), "-p".into(), "{{prompt}}".into()],
+        });
+    }
+
+    if command_exists("gemini") {
+        choices.push(EngineChoice {
+            name: "gemini",
+            argv: vec!["gemini".into(), "-p".into(), "{{prompt}}".into()],
         });
     }
 

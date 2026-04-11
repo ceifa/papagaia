@@ -1066,10 +1066,12 @@ name = "papagaia-overlay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "glib",
  "gtk4",
  "gtk4-layer-shell",
  "papagaia-core",
+ "serde",
  "serde_json",
 ]
 
