@@ -1,0 +1,14 @@
+[package]
+name = "papagaia-overlay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+papagaia-core = { path = "../papagaia-core" }
+glib = "0.20.7"
+gtk4 = "0.9.5"
+gtk4-layer-shell = "0.5.0"

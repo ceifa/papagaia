@@ -1,0 +1,17 @@
+[package]
+name = "papagaia-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "papagaia"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+serde_json.workspace = true
+papagaia-core = { path = "../papagaia-core" }
