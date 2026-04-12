@@ -11,12 +11,20 @@ use tokio::{
 use crate::cancel::CancelToken;
 
 pub async fn capture_selection(tools: &ToolConfig, cancel: &CancelToken) -> Result<String> {
+    let before = read_clipboard_text(tools, cancel).await.ok();
+    let probe = clipboard_probe_token();
+
+    run_command(&tools.write_clipboard_command, Some(&probe), cancel).await?;
     run_command(&tools.copy_command, None, cancel).await?;
     sleep(Duration::from_millis(tools.clipboard_settle_ms)).await;
-    let output = run_command(&tools.read_clipboard_command, None, cancel).await?;
-    let text = String::from_utf8(output.stdout).context("clipboard data was not valid UTF-8")?;
+    let text = read_clipboard_text(tools, cancel).await?;
     if text.trim().is_empty() {
-        bail!("clipboard copy produced empty text");
+        restore_clipboard_text(tools, before.as_deref(), cancel).await;
+        bail!("no text was selected");
+    }
+    if text == probe {
+        restore_clipboard_text(tools, before.as_deref(), cancel).await;
+        bail!("no text was selected");
     }
     Ok(text)
 }
@@ -62,11 +70,11 @@ pub async fn run_command(
         .spawn()
         .with_context(|| format!("failed to spawn {}", argv.join(" ")))?;
 
-    if let Some(text) = stdin_text {
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin.write_all(text.as_bytes()).await?;
-        }
+    if let Some(text) = stdin_text
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(text.as_bytes()).await?;
     }
 
     // Do not use wait_with_output() — commands like wl-copy fork a background
@@ -125,11 +133,11 @@ where
         .spawn()
         .with_context(|| format!("failed to spawn {}", argv.join(" ")))?;
 
-    if let Some(text) = stdin_text {
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin.write_all(text.as_bytes()).await?;
-        }
+    if let Some(text) = stdin_text
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(text.as_bytes()).await?;
     }
 
     let mut stdout = child.stdout.take();
@@ -197,6 +205,29 @@ where
         stdout: stdout_bytes,
         stderr,
     })
+}
+
+async fn read_clipboard_text(tools: &ToolConfig, cancel: &CancelToken) -> Result<String> {
+    let output = run_command(&tools.read_clipboard_command, None, cancel).await?;
+    String::from_utf8(output.stdout).context("clipboard data was not valid UTF-8")
+}
+
+async fn restore_clipboard_text(tools: &ToolConfig, text: Option<&str>, cancel: &CancelToken) {
+    if let Some(text) = text {
+        let _ = run_command(&tools.write_clipboard_command, Some(text), cancel).await;
+    }
+}
+
+fn clipboard_probe_token() -> String {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "__papagaia_selection_probe_{}_{}__",
+        std::process::id(),
+        nonce
+    )
 }
 
 /// Wait for the child to exit, killing it if the cancel token fires.
@@ -389,7 +420,18 @@ fn command_failure(argv: &[String], stderr: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render_text_command;
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use papagaia_core::ToolConfig;
+
+    use crate::cancel::CancelToken;
+
+    use super::{capture_selection, render_text_command};
 
     #[test]
     fn renders_text_placeholder() {
@@ -407,5 +449,154 @@ mod tests {
             render_text_command(&argv, "hello"),
             vec!["some-tool".to_string(), "hello".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn capture_selection_accepts_same_text_as_existing_clipboard() {
+        let dir = make_test_dir("capture-selection-same-text");
+        let clipboard_script = dir.join("clipboard.sh");
+        let clipboard_path = dir.join("clipboard.txt");
+        let selection_path = dir.join("selection.txt");
+
+        write_executable(
+            &clipboard_script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+mode="$1"
+clipboard="$2"
+selection="$3"
+case "$mode" in
+  read)
+    [[ -f "$clipboard" ]] && cat "$clipboard"
+    ;;
+  write)
+    cat > "$clipboard"
+    ;;
+  copy)
+    if [[ -s "$selection" ]]; then
+      cat "$selection" > "$clipboard"
+    fi
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+        );
+
+        fs::write(&clipboard_path, "same text").expect("clipboard should be written");
+        fs::write(&selection_path, "same text").expect("selection should be written");
+
+        let selected = capture_selection(
+            &fake_tools(&clipboard_script, &clipboard_path, &selection_path),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("selection should be captured");
+
+        assert_eq!(selected, "same text");
+        assert_eq!(
+            fs::read_to_string(&clipboard_path).expect("clipboard should be readable"),
+            "same text"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_selection_rejects_missing_selection_and_restores_clipboard() {
+        let dir = make_test_dir("capture-selection-missing");
+        let clipboard_script = dir.join("clipboard.sh");
+        let clipboard_path = dir.join("clipboard.txt");
+        let selection_path = dir.join("selection.txt");
+
+        write_executable(
+            &clipboard_script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+mode="$1"
+clipboard="$2"
+selection="$3"
+case "$mode" in
+  read)
+    [[ -f "$clipboard" ]] && cat "$clipboard"
+    ;;
+  write)
+    cat > "$clipboard"
+    ;;
+  copy)
+    if [[ -s "$selection" ]]; then
+      cat "$selection" > "$clipboard"
+    fi
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+        );
+
+        fs::write(&clipboard_path, "original clipboard").expect("clipboard should be written");
+        fs::write(&selection_path, "").expect("selection should be empty");
+
+        let error = capture_selection(
+            &fake_tools(&clipboard_script, &clipboard_path, &selection_path),
+            &CancelToken::new(),
+        )
+        .await
+        .expect_err("missing selection should fail");
+
+        assert!(error.to_string().contains("no text was selected"));
+        assert_eq!(
+            fs::read_to_string(&clipboard_path).expect("clipboard should be restored"),
+            "original clipboard"
+        );
+    }
+
+    fn fake_tools(
+        clipboard_script: &Path,
+        clipboard_path: &Path,
+        selection_path: &Path,
+    ) -> ToolConfig {
+        ToolConfig {
+            read_clipboard_command: vec![
+                clipboard_script.display().to_string(),
+                "read".into(),
+                clipboard_path.display().to_string(),
+                selection_path.display().to_string(),
+            ],
+            write_clipboard_command: vec![
+                clipboard_script.display().to_string(),
+                "write".into(),
+                clipboard_path.display().to_string(),
+                selection_path.display().to_string(),
+            ],
+            copy_command: vec![
+                clipboard_script.display().to_string(),
+                "copy".into(),
+                clipboard_path.display().to_string(),
+                selection_path.display().to_string(),
+            ],
+            paste_command: vec!["true".into()],
+            type_command: vec!["true".into()],
+            clipboard_settle_ms: 0,
+        }
+    }
+
+    fn make_test_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic enough for tests")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("papagaia-clipboard-{label}-{nonce}"));
+        fs::create_dir_all(&dir).expect("test dir should be created");
+        dir
+    }
+
+    fn write_executable(path: &Path, script: &str) {
+        fs::write(path, script).expect("script should be written");
+        let mut perms = fs::metadata(path)
+            .expect("script metadata should exist")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("script permissions should be updated");
     }
 }

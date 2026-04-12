@@ -51,10 +51,10 @@ impl OverlayHandle {
 
         tokio::task::spawn_blocking(move || {
             let mut guard = stdin.lock().expect("overlay stdin lock poisoned");
-            if let Some(stdin) = guard.as_mut() {
-                if stdin.write_all(line.as_bytes()).is_err() || stdin.flush().is_err() {
-                    *guard = None;
-                }
+            if let Some(stdin) = guard.as_mut()
+                && (stdin.write_all(line.as_bytes()).is_err() || stdin.flush().is_err())
+            {
+                *guard = None;
             }
         })
         .await
@@ -63,12 +63,12 @@ impl OverlayHandle {
 }
 
 fn overlay_program() -> PathBuf {
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            let sibling = parent.join("papagaia-overlay");
-            if sibling.exists() {
-                return sibling;
-            }
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        let sibling = parent.join("papagaia-overlay");
+        if sibling.exists() {
+            return sibling;
         }
     }
 

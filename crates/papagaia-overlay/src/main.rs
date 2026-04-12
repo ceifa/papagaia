@@ -209,10 +209,10 @@ fn build_picker_ui(app: &gtk::Application, entries: Vec<PickerEntry>) {
             glib::Propagation::Stop
         }
         gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter => {
-            if let Some(result) = picker_resolve(&list_for_key, &entries_for_key, &input_for_key) {
-                if let Ok(json) = serde_json::to_string(&result) {
-                    print!("{json}");
-                }
+            if let Some(result) = picker_resolve(&list_for_key, &entries_for_key, &input_for_key)
+                && let Ok(json) = serde_json::to_string(&result)
+            {
+                print!("{json}");
             }
             app_for_key.quit();
             glib::Propagation::Stop
@@ -424,10 +424,10 @@ fn build_ui(app: &gtk::Application) {
             match locked.read_line(&mut line) {
                 Ok(0) => break,
                 Ok(_) => {
-                    if let Ok(message) = serde_json::from_str::<OverlayMessage>(&line) {
-                        if tx.send(message).is_err() {
-                            break;
-                        }
+                    if let Ok(message) = serde_json::from_str::<OverlayMessage>(&line)
+                        && tx.send(message).is_err()
+                    {
+                        break;
                     }
                 }
                 Err(_) => break,

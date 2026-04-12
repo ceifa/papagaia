@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::{
+    Arc, Mutex as StdMutex, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 use anyhow::{Result, bail};
 use papagaia_core::{
@@ -23,22 +26,39 @@ pub struct App {
     config: RwLock<Arc<Config>>,
     overlay: OverlayHandle,
     state: Mutex<State>,
+    overlay_epoch: AtomicU64,
 }
 
 enum State {
     Idle,
-    Busy { label: String, cancel: CancelToken },
+    Busy {
+        label: String,
+        cancel: CancelToken,
+        overlay_epoch: u64,
+    },
     Recording(RecordingSession),
 }
 
 struct RecordingSession {
     recorder: Recorder,
     context: DictationContext,
+    overlay_epoch: u64,
 }
 
 #[derive(Default)]
 struct DictationContext {
     window_title: String,
+}
+
+struct BusySession {
+    cancel: CancelToken,
+    overlay_epoch: u64,
+}
+
+struct RawPromptOptions {
+    strip_markdown_fences: bool,
+    trim_whitespace: bool,
+    stream_output: bool,
 }
 
 impl DictationContext {
@@ -58,6 +78,7 @@ impl App {
             config: RwLock::new(Arc::new(config)),
             overlay,
             state: Mutex::new(State::Idle),
+            overlay_epoch: AtomicU64::new(0),
         })
     }
 
@@ -117,7 +138,7 @@ impl App {
         selected_text: Option<String>,
         preserve_selection: bool,
     ) -> Result<ClientResponse> {
-        let cancel = self
+        let session = self
             .enter_busy(format!("running prompt '{prompt_name}'"))
             .await?;
         let outcome = self
@@ -125,10 +146,10 @@ impl App {
                 prompt_name,
                 selected_text.as_deref(),
                 preserve_selection,
-                &cancel,
+                &session.cancel,
             )
             .await;
-        self.leave_busy().await;
+        self.leave_busy(session.overlay_epoch).await;
 
         let config = self.config();
         match outcome {
@@ -139,12 +160,13 @@ impl App {
                     format!("Pasted {prompt_name} output")
                 };
                 log!(config, "[transform] {msg}");
-                self.flash_result(true, msg).await;
+                self.flash_result(session.overlay_epoch, true, msg).await;
                 Ok(ClientResponse::with_text("transform complete", text))
             }
             Err(error) => {
                 log!(config, "[transform] error: {error:#}");
-                self.finish_error(&cancel, &error).await;
+                self.finish_error(session.overlay_epoch, &session.cancel, &error)
+                    .await;
                 Err(error)
             }
         }
@@ -244,19 +266,22 @@ impl App {
         trim_whitespace: bool,
         stream_output: bool,
     ) -> Result<ClientResponse> {
-        let cancel = self.enter_busy("running ad-hoc prompt".into()).await?;
+        let session = self.enter_busy("running ad-hoc prompt".into()).await?;
+        let options = RawPromptOptions {
+            strip_markdown_fences,
+            trim_whitespace,
+            stream_output,
+        };
         let outcome = self
             .transform_raw_inner(
                 template,
                 selected_text.as_deref(),
                 preserve_selection,
-                strip_markdown_fences,
-                trim_whitespace,
-                stream_output,
-                &cancel,
+                options,
+                &session.cancel,
             )
             .await;
-        self.leave_busy().await;
+        self.leave_busy(session.overlay_epoch).await;
 
         let config = self.config();
         match outcome {
@@ -267,12 +292,13 @@ impl App {
                     "Pasted engine output"
                 };
                 log!(config, "[transform-raw] {msg}");
-                self.flash_result(true, msg).await;
+                self.flash_result(session.overlay_epoch, true, msg).await;
                 Ok(ClientResponse::with_text("transform complete", text))
             }
             Err(error) => {
                 log!(config, "[transform-raw] error: {error:#}");
-                self.finish_error(&cancel, &error).await;
+                self.finish_error(session.overlay_epoch, &session.cancel, &error)
+                    .await;
                 Err(error)
             }
         }
@@ -283,9 +309,7 @@ impl App {
         template: &str,
         selected_text: Option<&str>,
         preserve_selection: bool,
-        strip_markdown_fences: bool,
-        trim_whitespace: bool,
-        stream_output: bool,
+        options: RawPromptOptions,
         cancel: &CancelToken,
     ) -> Result<(String, bool)> {
         // Capture phase: wtype needs the original window focused — no grab.
@@ -310,9 +334,9 @@ impl App {
         let prompt = PromptConfig {
             name: "ad-hoc".into(),
             template: template.into(),
-            strip_markdown_fences,
-            trim_whitespace,
-            stream_output,
+            strip_markdown_fences: options.strip_markdown_fences,
+            trim_whitespace: options.trim_whitespace,
+            stream_output: options.stream_output,
         };
         validate_prompt_options(&prompt)?;
 
@@ -334,9 +358,9 @@ impl App {
         log!(
             config,
             "[transform-raw] stream={} strip_fences={} trim_ws={} selected={}",
-            stream_output,
-            strip_markdown_fences,
-            trim_whitespace,
+            options.stream_output,
+            options.strip_markdown_fences,
+            options.trim_whitespace,
             selected.is_some()
         );
         log!(config, "[transform-raw] rendered prompt: {rendered_prompt}");
@@ -392,6 +416,7 @@ impl App {
             if !matches!(*state, State::Idle) {
                 bail!("papagaia is already busy");
             }
+            let overlay_epoch = self.next_overlay_epoch();
 
             let (level_tx, mut level_rx) = mpsc::unbounded_channel();
             let recorder = Recorder::start(level_tx)?;
@@ -407,7 +432,11 @@ impl App {
                 }
             });
 
-            *state = State::Recording(RecordingSession { recorder, context });
+            *state = State::Recording(RecordingSession {
+                recorder,
+                context,
+                overlay_epoch,
+            });
         }
 
         self.overlay
@@ -421,16 +450,25 @@ impl App {
 
     async fn dictate_stop(&self) -> Result<ClientResponse> {
         let cancel = CancelToken::new();
-        let (recorder, context) = {
+        let (recorder, context, overlay_epoch) = {
             let mut state = self.state.lock().await;
             match std::mem::replace(
                 &mut *state,
                 State::Busy {
                     label: "transcribing".into(),
                     cancel: cancel.clone(),
+                    overlay_epoch: 0,
                 },
             ) {
-                State::Recording(session) => (session.recorder, session.context),
+                State::Recording(session) => {
+                    let overlay_epoch = session.overlay_epoch;
+                    *state = State::Busy {
+                        label: "transcribing".into(),
+                        cancel: cancel.clone(),
+                        overlay_epoch,
+                    };
+                    (session.recorder, session.context, overlay_epoch)
+                }
                 other => {
                     *state = other;
                     bail!("papagaia is not recording");
@@ -490,12 +528,21 @@ impl App {
                     )
                     .await?;
                     log!(config, "[dictate] post-processed (streamed): {processed}");
+                    if processed.is_empty() {
+                        overlay
+                            .send(OverlayMessage::Busy {
+                                label: "Typing".into(),
+                                grab_keyboard: false,
+                            })
+                            .await;
+                        sleep(Duration::from_millis(80)).await;
+                        clipboard::paste_text(&config.tools, &cleaned, &cancel).await?;
+                        maybe_remove_audio(&config, &audio_path);
+                        return Ok(cleaned);
+                    }
+
                     maybe_remove_audio(&config, &audio_path);
-                    return if processed.is_empty() {
-                        Ok(cleaned)
-                    } else {
-                        Ok(processed)
-                    };
+                    return Ok(processed);
                 }
 
                 overlay
@@ -532,17 +579,18 @@ impl App {
         }
         .await;
 
-        self.leave_busy().await;
+        self.leave_busy(overlay_epoch).await;
 
         match outcome {
             Ok(text) => {
                 log!(config, "[dictate] inserted: {text}");
-                self.flash_result(true, "Dictation inserted").await;
+                self.flash_result(overlay_epoch, true, "Dictation inserted")
+                    .await;
                 Ok(ClientResponse::with_text("dictation complete", text))
             }
             Err(error) => {
                 log!(config, "[dictate] error: {error:#}");
-                self.finish_error(&cancel, &error).await;
+                self.finish_error(overlay_epoch, &cancel, &error).await;
                 Err(error)
             }
         }
@@ -557,7 +605,11 @@ impl App {
                 self.overlay.send(OverlayMessage::Hidden).await;
                 Ok(ClientResponse::ok("dictation cancelled"))
             }
-            State::Busy { label, cancel } => {
+            State::Busy {
+                label,
+                cancel,
+                overlay_epoch,
+            } => {
                 // Leave the Busy state in place so the in-flight operation can
                 // unwind normally (leave_busy + flash_result). We just flip the
                 // cancellation flag — the subprocess wait loop will notice and
@@ -565,6 +617,7 @@ impl App {
                 *state = State::Busy {
                     label,
                     cancel: cancel.clone(),
+                    overlay_epoch,
                 };
                 drop(state);
                 cancel.cancel();
@@ -590,29 +643,44 @@ impl App {
         }
     }
 
-    async fn enter_busy(&self, label: String) -> Result<CancelToken> {
+    async fn enter_busy(&self, label: String) -> Result<BusySession> {
         let mut state = self.state.lock().await;
         if !matches!(*state, State::Idle) {
             bail!("papagaia is already busy");
         }
         let cancel = CancelToken::new();
+        let overlay_epoch = self.next_overlay_epoch();
         *state = State::Busy {
             label,
             cancel: cancel.clone(),
+            overlay_epoch,
         };
-        Ok(cancel)
+        Ok(BusySession {
+            cancel,
+            overlay_epoch,
+        })
     }
 
-    async fn leave_busy(&self) {
+    async fn leave_busy(&self, overlay_epoch: u64) {
         let mut state = self.state.lock().await;
-        *state = State::Idle;
+        if matches!(
+            &*state,
+            State::Busy {
+                overlay_epoch: current,
+                ..
+            } if *current == overlay_epoch
+        ) {
+            *state = State::Idle;
+        }
     }
 
-    async fn finish_error(&self, cancel: &CancelToken, error: &anyhow::Error) {
+    async fn finish_error(&self, overlay_epoch: u64, cancel: &CancelToken, error: &anyhow::Error) {
         if cancel.is_cancelled() {
-            self.overlay.send(OverlayMessage::Hidden).await;
+            if self.is_current_overlay_epoch(overlay_epoch) {
+                self.overlay.send(OverlayMessage::Hidden).await;
+            }
         } else {
-            self.flash_result(false, error.to_string()).await;
+            self.flash_result(overlay_epoch, false, error.to_string()).await;
         }
     }
 
@@ -636,7 +704,10 @@ impl App {
         DictationContext { window_title }
     }
 
-    async fn flash_result(&self, ok: bool, message: impl Into<String>) {
+    async fn flash_result(&self, overlay_epoch: u64, ok: bool, message: impl Into<String>) {
+        if !self.is_current_overlay_epoch(overlay_epoch) {
+            return;
+        }
         let message = message.into();
         self.overlay
             .send(OverlayMessage::Result {
@@ -645,7 +716,17 @@ impl App {
             })
             .await;
         sleep(Duration::from_millis(900)).await;
-        self.overlay.send(OverlayMessage::Hidden).await;
+        if self.is_current_overlay_epoch(overlay_epoch) {
+            self.overlay.send(OverlayMessage::Hidden).await;
+        }
+    }
+
+    fn next_overlay_epoch(&self) -> u64 {
+        self.overlay_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn is_current_overlay_epoch(&self, overlay_epoch: u64) -> bool {
+        self.overlay_epoch.load(Ordering::Acquire) == overlay_epoch
     }
 }
 

@@ -94,12 +94,12 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
 }
 
 fn resolve_daemon_binary() -> Option<PathBuf> {
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(dir) = current.parent() {
-            let candidate = dir.join("papagaia-daemon");
-            if candidate.exists() {
-                return Some(candidate);
-            }
+    if let Ok(current) = std::env::current_exe()
+        && let Some(dir) = current.parent()
+    {
+        let candidate = dir.join("papagaia-daemon");
+        if candidate.exists() {
+            return Some(candidate);
         }
     }
 

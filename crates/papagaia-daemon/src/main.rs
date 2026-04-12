@@ -5,9 +5,15 @@ mod dictation;
 mod llm;
 mod overlay;
 
-use std::{fs, sync::Arc};
+use std::{
+    fs,
+    io::ErrorKind,
+    os::unix::fs::FileTypeExt,
+    path::Path,
+    sync::Arc,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use app::App;
 use papagaia_core::{ClientRequest, ClientResponse, Config, runtime_dir, socket_path};
 use tokio::{
@@ -27,10 +33,7 @@ async fn main() -> Result<()> {
     })?;
 
     let socket_path = socket_path()?;
-    if socket_path.exists() {
-        fs::remove_file(&socket_path)
-            .with_context(|| format!("failed to remove stale socket {}", socket_path.display()))?;
-    }
+    prepare_socket_path(&socket_path)?;
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind socket {}", socket_path.display()))?;
@@ -51,6 +54,43 @@ async fn main() -> Result<()> {
             }
         });
     }
+}
+
+fn prepare_socket_path(socket_path: &Path) -> Result<()> {
+    if !socket_path.exists() {
+        return Ok(());
+    }
+
+    let metadata = fs::symlink_metadata(socket_path)
+        .with_context(|| format!("failed to inspect socket path {}", socket_path.display()))?;
+    if !metadata.file_type().is_socket() {
+        bail!(
+            "refusing to remove non-socket path at {}",
+            socket_path.display()
+        );
+    }
+
+    match std::os::unix::net::UnixStream::connect(socket_path) {
+        Ok(_) => bail!(
+            "papagaia-daemon is already running at {}",
+            socket_path.display()
+        ),
+        Err(error) if matches!(error.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound) => {
+            fs::remove_file(socket_path).with_context(|| {
+                format!("failed to remove stale socket {}", socket_path.display())
+            })?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to probe existing socket at {}; another daemon may still be using it",
+                    socket_path.display()
+                )
+            });
+        }
+    }
+
+    Ok(())
 }
 
 async fn handle_connection(app: Arc<App>, stream: UnixStream) -> Result<()> {

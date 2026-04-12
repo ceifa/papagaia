@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Args, Parser, Subcommand};
-use papagaia_core::{ClientRequest, ClientResponse, Config, ToolConfig, expand_home, socket_path};
+use papagaia_core::{ClientRequest, ClientResponse, Config, expand_home, socket_path};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -206,7 +206,6 @@ fn prompt_summary(template: &str) -> String {
 
 fn run_pick() -> Result<()> {
     let config = Config::load()?;
-    let selected_text = capture_selection_snapshot(&config.tools);
     let entries: Vec<serde_json::Value> = config
         .prompts
         .iter()
@@ -256,8 +255,8 @@ fn run_pick() -> Result<()> {
                 .to_string();
             print_response(send_request(&ClientRequest::Transform {
                 prompt: name,
-                selected_text,
-                preserve_selection: true,
+                selected_text: None,
+                preserve_selection: false,
             })?)
         }
         Some("raw") => {
@@ -280,8 +279,8 @@ fn run_pick() -> Result<()> {
                 .unwrap_or(true);
             print_response(send_request(&ClientRequest::TransformRaw {
                 template,
-                selected_text,
-                preserve_selection: true,
+                selected_text: None,
+                preserve_selection: false,
                 strip_markdown_fences,
                 trim_whitespace,
                 stream_output,
@@ -291,71 +290,13 @@ fn run_pick() -> Result<()> {
     }
 }
 
-fn capture_selection_snapshot(tools: &ToolConfig) -> Option<String> {
-    // Snapshot clipboard before Ctrl+C so we can detect whether the copy
-    // actually changed it (= something was selected) or left it unchanged
-    // (= stale content from a previous copy).
-    let before = run_tool(&tools.read_clipboard_command, None)
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-
-    run_tool(&tools.copy_command, None).ok()?;
-    thread::sleep(Duration::from_millis(tools.clipboard_settle_ms));
-    let output = run_tool(&tools.read_clipboard_command, None).ok()?;
-    let text = String::from_utf8(output.stdout).ok()?;
-    if text.trim().is_empty() || text == before {
-        return None;
-    }
-    Some(text)
-}
-
-fn run_tool(argv: &[String], stdin_text: Option<&str>) -> Result<std::process::Output> {
-    let Some(program) = argv.first() else {
-        bail!("cannot run an empty command");
-    };
-
-    let mut command = std::process::Command::new(program);
-    command.args(&argv[1..]);
-    if stdin_text.is_some() {
-        command.stdin(std::process::Stdio::piped());
-    }
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to spawn {}", argv.join(" ")))?;
-
-    if let Some(text) = stdin_text {
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes())?;
-        }
-    }
-
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("failed to wait for {}", argv.join(" ")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let details = stderr.trim();
-        if details.is_empty() {
-            bail!("command failed: {}", argv.join(" "));
-        }
-        bail!("command failed: {}: {details}", argv.join(" "));
-    }
-
-    Ok(output)
-}
-
 fn overlay_program() -> PathBuf {
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            let sibling = parent.join("papagaia-overlay");
-            if sibling.exists() {
-                return sibling;
-            }
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        let sibling = parent.join("papagaia-overlay");
+        if sibling.exists() {
+            return sibling;
         }
     }
     PathBuf::from("papagaia-overlay")
