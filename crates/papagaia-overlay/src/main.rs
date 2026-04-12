@@ -531,7 +531,11 @@ fn apply_message(state: &UiState, message: OverlayMessage) {
                 layer_shell::KeyboardMode::None
             };
             state.window.set_keyboard_mode(mode);
-            state.window.present();
+            if grab_keyboard {
+                state.window.present();
+            } else {
+                state.window.show();
+            }
         }
         OverlayMessage::Recording { level, transcript } => {
             set_state_class(state, "state-recording");
@@ -561,7 +565,7 @@ fn apply_message(state: &UiState, message: OverlayMessage) {
             state
                 .window
                 .set_keyboard_mode(layer_shell::KeyboardMode::None);
-            state.window.present();
+            state.window.show();
         }
     }
 }
@@ -616,13 +620,7 @@ fn install_css() {
             background: linear-gradient(160deg, #171b25 0%, #0f1218 100%);
             color: #e9edf3;
             border-radius: 12px;
-            border-top: 1px solid rgba(255, 255, 255, 0.06);
-            border-right: 1px solid rgba(255, 255, 255, 0.06);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
             border-left: 3px solid #2a313f;
-            box-shadow: 0 20px 52px rgba(0, 0, 0, 0.55),
-                        0 2px 6px rgba(0, 0, 0, 0.4),
-                        inset 0 1px 0 rgba(255, 255, 255, 0.05);
             min-width: 180px;
         }
 

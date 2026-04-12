@@ -34,6 +34,12 @@ async fn main() -> Result<()> {
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind socket {}", socket_path.display()))?;
+    if config.logging {
+        eprintln!(
+            "[papagaia] daemon started, listening on {}",
+            socket_path.display()
+        );
+    }
     let app = Arc::new(App::new(config).await?);
 
     loop {

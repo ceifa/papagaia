@@ -6,11 +6,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
+    pub logging: bool,
+    #[serde(default)]
     pub tools: ToolConfig,
     #[serde(default)]
     pub overlay: OverlayConfig,
     #[serde(default)]
     pub whisper: WhisperConfig,
+    #[serde(default)]
+    pub dictation: DictationConfig,
     pub engine: EngineConfig,
     #[serde(default)]
     pub prompts: Vec<PromptConfig>,
@@ -124,6 +128,45 @@ impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
             enabled: default_overlay_enabled(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DictationConfig {
+    /// Post-process the whisper transcript through the LLM engine.
+    #[serde(default)]
+    pub post_process: bool,
+    /// Stream post-processed output incrementally as the engine produces it.
+    #[serde(default = "default_true")]
+    pub stream_post_process: bool,
+    /// Prompt template for post-processing. Uses `{{text}}` for the transcript
+    /// and `{{context}}` for an auto-generated context block.
+    #[serde(default = "default_dictation_template")]
+    pub post_process_template: String,
+    /// Capture the focused window title before recording to provide context
+    /// for post-processing.
+    #[serde(default)]
+    pub context_awareness: bool,
+    /// Command that returns the focused window information (title, app id).
+    /// Supports JSON output from niri, hyprctl, and sway.
+    #[serde(default)]
+    pub window_title_command: Vec<String>,
+    /// Keep recorded WAV files in /tmp instead of deleting them after
+    /// transcription. Useful for diagnosing audio capture issues.
+    #[serde(default)]
+    pub keep_audio_files: bool,
+}
+
+impl Default for DictationConfig {
+    fn default() -> Self {
+        Self {
+            post_process: false,
+            stream_post_process: true,
+            post_process_template: default_dictation_template(),
+            context_awareness: false,
+            window_title_command: Vec::new(),
+            keep_audio_files: false,
         }
     }
 }
@@ -279,6 +322,24 @@ fn default_overlay_enabled() -> bool {
     true
 }
 
+fn default_dictation_template() -> String {
+    r#"You are a voice-to-text post-processor. Your job is to turn raw speech transcription into clean, ready-to-use text.
+
+Rules:
+- Fix punctuation, capitalization, and grammar
+- Remove filler words and speech artifacts (um, uh, like, you know, so, basically, I mean, right, well, tipo, né, então)
+- Remove false starts and repeated words ("I want to I want to go" → "I want to go")
+- Interpret voice commands literally: "new line" or "nova linha" → insert a line break, "new paragraph" or "novo parágrafo" → insert two line breaks, "period" or "ponto final" → ".", "comma" or "vírgula" → ","
+- Preserve the original language — do not translate
+- Preserve the speaker's meaning, intent, and tone
+- Do not add, invent, or editorialize any content
+- Output only the cleaned text, nothing else — no preamble, no quotes, no explanation
+{{context}}
+Transcription:
+{{text}}"#
+        .into()
+}
+
 fn default_clipboard_settle_ms() -> u64 {
     120
 }
@@ -354,8 +415,9 @@ fn wtype_type_command() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, EngineConfig, OverlayConfig, PromptConfig, ToolConfig, WhisperConfig, expand_home,
-        render_prompt_template, strip_outer_markdown_fence, validate_prompt_options,
+        Config, DictationConfig, EngineConfig, OverlayConfig, PromptConfig, ToolConfig,
+        WhisperConfig, expand_home, render_prompt_template, strip_outer_markdown_fence,
+        validate_prompt_options,
     };
 
     #[test]
@@ -393,9 +455,11 @@ mod tests {
     #[test]
     fn config_rejects_streaming_prompt_with_fence_stripping() {
         let config = Config {
+            logging: false,
             tools: ToolConfig::default(),
             overlay: OverlayConfig::default(),
             whisper: WhisperConfig::default(),
+            dictation: DictationConfig::default(),
             engine: EngineConfig {
                 argv: vec!["engine".into()],
                 stdin: false,

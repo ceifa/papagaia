@@ -28,6 +28,7 @@ pub async fn paste_text(tools: &ToolConfig, text: &str, cancel: &CancelToken) ->
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn type_text(tools: &ToolConfig, text: &str, cancel: &CancelToken) -> Result<()> {
     let argv = render_text_command(&tools.type_command, text);
     run_command(&argv, None, cancel).await?;
@@ -146,17 +147,26 @@ where
             break;
         }
 
-        tokio::select! {
+        // Read raw bytes inside the select! so cancellation and the periodic
+        // child.try_wait() poll stay responsive. The callback is deliberately
+        // invoked OUTSIDE the select!: tokio::select! drops the losing branch,
+        // and a slow callback (e.g. one that awaits wtype) would get cancelled
+        // mid-flight whenever the 40ms timer branch won the race.
+        let bytes = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 bail!("operation cancelled");
             }
-            read = read_stdout_chunk(&mut stdout, &mut stdout_bytes, &mut pending_utf8, &mut on_stdout) => {
-                read?;
-            }
-            _ = sleep(Duration::from_millis(40)) => {}
+            read = read_stdout_bytes(&mut stdout) => read?,
+            _ = sleep(Duration::from_millis(40)) => continue,
+        };
+
+        if let Some(bytes) = bytes {
+            stdout_bytes.extend_from_slice(&bytes);
+            pending_utf8.extend_from_slice(&bytes);
+            flush_valid_utf8(&mut pending_utf8, &mut on_stdout).await?;
         }
     }
 
@@ -245,32 +255,25 @@ async fn drain_pipe<R: AsyncRead + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
     }
 }
 
-async fn read_stdout_chunk<F, Fut>(
+/// Read the next chunk of stdout bytes. Returns `Ok(None)` when the pipe
+/// closes. Never invokes the streaming callback — callers should run the
+/// callback outside of any `select!`/`timeout` wrapper, otherwise a slow
+/// callback gets dropped mid-flight when the enclosing future loses a race.
+async fn read_stdout_bytes(
     child_stdout: &mut Option<tokio::process::ChildStdout>,
-    stdout_bytes: &mut Vec<u8>,
-    pending_utf8: &mut Vec<u8>,
-    on_stdout: &mut F,
-) -> Result<()>
-where
-    F: FnMut(String) -> Fut,
-    Fut: Future<Output = Result<()>>,
-{
+) -> Result<Option<Vec<u8>>> {
     let Some(stdout) = child_stdout.as_mut() else {
         sleep(Duration::from_millis(40)).await;
-        return Ok(());
+        return Ok(None);
     };
 
     let mut buf = [0_u8; 1024];
     match stdout.read(&mut buf).await {
         Ok(0) => {
             *child_stdout = None;
-            Ok(())
+            Ok(None)
         }
-        Ok(read) => {
-            stdout_bytes.extend_from_slice(&buf[..read]);
-            pending_utf8.extend_from_slice(&buf[..read]);
-            flush_valid_utf8(pending_utf8, on_stdout).await
-        }
+        Ok(read) => Ok(Some(buf[..read].to_vec())),
         Err(error) => Err(error).context("failed to read command stdout"),
     }
 }
@@ -286,13 +289,14 @@ where
     Fut: Future<Output = Result<()>>,
 {
     while stdout.is_some() {
-        match tokio::time::timeout(
-            Duration::from_millis(200),
-            read_stdout_chunk(stdout, stdout_bytes, pending_utf8, on_stdout),
-        )
-        .await
-        {
-            Ok(result) => result?,
+        match tokio::time::timeout(Duration::from_millis(200), read_stdout_bytes(stdout)).await {
+            Ok(Ok(Some(bytes))) => {
+                stdout_bytes.extend_from_slice(&bytes);
+                pending_utf8.extend_from_slice(&bytes);
+                flush_valid_utf8(pending_utf8, on_stdout).await?;
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => return Err(error),
             Err(_) => break,
         }
     }
@@ -339,6 +343,7 @@ fn take_valid_utf8_prefix(buffer: &mut Vec<u8>) -> Result<Option<String>> {
     }
 }
 
+#[allow(dead_code)]
 fn render_text_command(argv: &[String], text: &str) -> Vec<String> {
     let mut rendered = Vec::with_capacity(argv.len() + 1);
     let mut used_placeholder = false;

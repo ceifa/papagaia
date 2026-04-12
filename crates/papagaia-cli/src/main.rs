@@ -88,6 +88,8 @@ struct DetectedEnvironment {
     whisper_cli: bool,
     whisper_model: Option<PathBuf>,
     engine_choices: Vec<EngineChoice>,
+    niri: bool,
+    hyprland: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -265,17 +267,17 @@ fn run_pick() -> Result<()> {
                 .context("picker result missing 'template'")?
                 .to_string();
             let strip_markdown_fences = result
-                .get("strip_markdown_fences")
+                .get("strip-markdown-fences")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+                .unwrap_or(false);
             let trim_whitespace = result
-                .get("trim_whitespace")
+                .get("trim-whitespace")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
             let stream_output = result
-                .get("stream_output")
+                .get("stream-output")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .unwrap_or(true);
             print_response(send_request(&ClientRequest::TransformRaw {
                 template,
                 selected_text,
@@ -290,11 +292,19 @@ fn run_pick() -> Result<()> {
 }
 
 fn capture_selection_snapshot(tools: &ToolConfig) -> Option<String> {
+    // Snapshot clipboard before Ctrl+C so we can detect whether the copy
+    // actually changed it (= something was selected) or left it unchanged
+    // (= stale content from a previous copy).
+    let before = run_tool(&tools.read_clipboard_command, None)
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+
     run_tool(&tools.copy_command, None).ok()?;
     thread::sleep(Duration::from_millis(tools.clipboard_settle_ms));
     let output = run_tool(&tools.read_clipboard_command, None).ok()?;
     let text = String::from_utf8(output.stdout).ok()?;
-    if text.trim().is_empty() {
+    if text.trim().is_empty() || text == before {
         return None;
     }
     Some(text)
@@ -668,6 +678,8 @@ fn detect_environment() -> DetectedEnvironment {
         whisper_cli: command_exists("whisper-cli"),
         whisper_model: find_whisper_model(),
         engine_choices: detect_engine_choices(),
+        niri: command_exists("niri"),
+        hyprland: command_exists("hyprctl"),
     }
 }
 
@@ -690,9 +702,18 @@ fn render_init_config(environment: &DetectedEnvironment) -> String {
         .unwrap_or_else(|| {
             "# Configure this to whichever CLI you want to use for text transformation.\n".into()
         });
+    let window_title_command = if environment.niri {
+        toml_array(&["niri", "msg", "-j", "focused-window"])
+    } else if environment.hyprland {
+        toml_array(&["hyprctl", "activewindow", "-j"])
+    } else {
+        "[]".into()
+    };
 
     format!(
-        r#"[tools]
+        r#"logging = false
+
+[tools]
 read_clipboard_command = ["wl-paste", "--no-newline"]
 write_clipboard_command = ["wl-copy"]
 copy_command = {copy_command}
@@ -705,8 +726,35 @@ enabled = true
 
 [whisper]
 model = "{whisper_model}"
-argv = ["whisper-cli", "-m", "{{{{model}}}}", "-f", "{{{{audio_path}}}}", "-np", "-nt", "-l", "auto"]
+argv = ["whisper-cli", "-m", "{{{{model}}}}", "-f", "{{{{audio_path}}}}", "-np", "-nt", "-l", "auto", "--prompt", "Natural spoken dictation with correct punctuation, natural sentences, and no filler words."]
 capture_stdout = true
+
+[dictation]
+# Post-process dictation through the LLM engine to clean up transcription.
+# When enabled, the whisper transcript is refined by the configured [engine]
+# before being typed into the focused window.
+post_process = false
+stream_post_process = true
+post_process_template = """
+You are a voice-to-text post-processor. Your job is to turn raw speech transcription into clean, ready-to-use text.
+
+Rules:
+- Fix punctuation, capitalization, and grammar
+- Remove filler words and speech artifacts (um, uh, like, you know, so, basically, I mean, right, well, tipo, né, então)
+- Remove false starts and repeated words ("I want to I want to go" → "I want to go")
+- Interpret voice commands literally: "new line" or "nova linha" → insert a line break, "new paragraph" or "novo parágrafo" → insert two line breaks, "period" or "ponto final" → ".", "comma" or "vírgula" → ","
+- Preserve the original language — do not translate
+- Preserve the speaker's meaning, intent, and tone
+- Do not add, invent, or editorialize any content
+- Output only the cleaned text, nothing else — no preamble, no quotes, no explanation
+{{{{context}}}}
+Transcription:
+{{{{text}}}}
+"""
+# Capture the focused window title before recording starts.
+# This context is injected into the post-processing prompt via {{{{context}}}}.
+context_awareness = false
+window_title_command = {window_title_command}
 
 {engine_comment}[engine]
 argv = {engine_command}
@@ -762,14 +810,26 @@ fn detect_engine_choices() -> Vec<EngineChoice> {
     if command_exists("codex") {
         choices.push(EngineChoice {
             name: "codex",
-            argv: vec!["codex".into(), "exec".into(), "{{prompt}}".into()],
+            argv: vec![
+                "codex".into(),
+                "exec".into(),
+                "--model".into(),
+                "gpt-5.4-mini".into(),
+                "{{prompt}}".into(),
+            ],
         });
     }
 
     if command_exists("claude") {
         choices.push(EngineChoice {
             name: "claude",
-            argv: vec!["claude".into(), "-p".into(), "{{prompt}}".into()],
+            argv: vec![
+                "claude".into(),
+                "-p".into(),
+                "--model".into(),
+                "haiku".into(),
+                "{{prompt}}".into(),
+            ],
         });
     }
 
@@ -779,6 +839,8 @@ fn detect_engine_choices() -> Vec<EngineChoice> {
             argv: vec![
                 "gh".into(),
                 "copilot".into(),
+                "--model".into(),
+                "auto".into(),
                 "-p".into(),
                 "{{prompt}}".into(),
             ],
@@ -795,7 +857,13 @@ fn detect_engine_choices() -> Vec<EngineChoice> {
     if command_exists("gemini") {
         choices.push(EngineChoice {
             name: "gemini",
-            argv: vec!["gemini".into(), "-p".into(), "{{prompt}}".into()],
+            argv: vec![
+                "gemini".into(),
+                "-p".into(),
+                "-m".into(),
+                "gemini-3.1-flash-lite-preview".into(),
+                "{{prompt}}".into(),
+            ],
         });
     }
 
@@ -982,10 +1050,17 @@ mod tests {
                 name: "codex",
                 argv: vec!["codex".into(), "exec".into(), "{{prompt}}".into()],
             }],
+            niri: true,
+            hyprland: false,
         };
 
         let config = render_init_config(&environment);
         assert!(config.contains("model = \"/tmp/model.bin\""));
         assert!(config.contains("argv = [\"codex\", \"exec\", \"{{prompt}}\"]"));
+        assert!(config.contains("[dictation]"));
+        assert!(
+            config
+                .contains("window_title_command = [\"niri\", \"msg\", \"-j\", \"focused-window\"]")
+        );
     }
 }
