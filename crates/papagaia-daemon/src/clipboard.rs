@@ -14,7 +14,13 @@ pub async fn capture_selection(tools: &ToolConfig, cancel: &CancelToken) -> Resu
     let before = read_clipboard_text(tools, cancel).await.ok();
     let probe = clipboard_probe_token();
 
-    run_command(&tools.write_clipboard_command, Some(&probe), cancel).await?;
+    write_clipboard_text(
+        tools,
+        &probe,
+        ClipboardWriteMode::SensitiveBestEffort,
+        cancel,
+    )
+    .await?;
     run_command(&tools.copy_command, None, cancel).await?;
     sleep(Duration::from_millis(tools.clipboard_settle_ms)).await;
     let text = read_clipboard_text(tools, cancel).await?;
@@ -30,16 +36,9 @@ pub async fn capture_selection(tools: &ToolConfig, cancel: &CancelToken) -> Resu
 }
 
 pub async fn paste_text(tools: &ToolConfig, text: &str, cancel: &CancelToken) -> Result<()> {
-    run_command(&tools.write_clipboard_command, Some(text), cancel).await?;
+    write_clipboard_text(tools, text, ClipboardWriteMode::Default, cancel).await?;
     sleep(Duration::from_millis(30)).await;
     run_command(&tools.paste_command, None, cancel).await?;
-    Ok(())
-}
-
-#[allow(dead_code)]
-pub async fn type_text(tools: &ToolConfig, text: &str, cancel: &CancelToken) -> Result<()> {
-    let argv = render_text_command(&tools.type_command, text);
-    run_command(&argv, None, cancel).await?;
     Ok(())
 }
 
@@ -214,8 +213,44 @@ async fn read_clipboard_text(tools: &ToolConfig, cancel: &CancelToken) -> Result
 
 async fn restore_clipboard_text(tools: &ToolConfig, text: Option<&str>, cancel: &CancelToken) {
     if let Some(text) = text {
-        let _ = run_command(&tools.write_clipboard_command, Some(text), cancel).await;
+        let _ = write_clipboard_text(tools, text, ClipboardWriteMode::Default, cancel).await;
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClipboardWriteMode {
+    Default,
+    SensitiveBestEffort,
+}
+
+async fn write_clipboard_text(
+    tools: &ToolConfig,
+    text: &str,
+    mode: ClipboardWriteMode,
+    cancel: &CancelToken,
+) -> Result<()> {
+    if matches!(mode, ClipboardWriteMode::SensitiveBestEffort)
+        && let Some(argv) = with_wl_copy_sensitive_flag(&tools.write_clipboard_command)
+        && run_command(&argv, Some(text), cancel).await.is_ok()
+    {
+        return Ok(());
+    }
+
+    run_command(&tools.write_clipboard_command, Some(text), cancel).await?;
+    Ok(())
+}
+
+fn with_wl_copy_sensitive_flag(argv: &[String]) -> Option<Vec<String>> {
+    let (program, rest) = argv.split_first()?;
+    if program != "wl-copy" || rest.iter().any(|arg| arg == "--sensitive") {
+        return None;
+    }
+
+    let mut sensitive = Vec::with_capacity(argv.len() + 1);
+    sensitive.push(program.clone());
+    sensitive.push("--sensitive".into());
+    sensitive.extend(rest.iter().cloned());
+    Some(sensitive)
 }
 
 fn clipboard_probe_token() -> String {
@@ -374,27 +409,6 @@ fn take_valid_utf8_prefix(buffer: &mut Vec<u8>) -> Result<Option<String>> {
     }
 }
 
-#[allow(dead_code)]
-fn render_text_command(argv: &[String], text: &str) -> Vec<String> {
-    let mut rendered = Vec::with_capacity(argv.len() + 1);
-    let mut used_placeholder = false;
-
-    for arg in argv {
-        if arg.contains("{{text}}") {
-            rendered.push(arg.replace("{{text}}", text));
-            used_placeholder = true;
-        } else {
-            rendered.push(arg.clone());
-        }
-    }
-
-    if !used_placeholder {
-        rendered.push(text.to_string());
-    }
-
-    rendered
-}
-
 fn command_failure(argv: &[String], stderr: &str) -> String {
     let command = argv.join(" ");
     let details = if stderr.is_empty() {
@@ -431,7 +445,27 @@ mod tests {
 
     use crate::cancel::CancelToken;
 
-    use super::{capture_selection, render_text_command};
+    use super::{capture_selection, with_wl_copy_sensitive_flag};
+
+    fn render_text_command(argv: &[String], text: &str) -> Vec<String> {
+        let mut rendered = Vec::with_capacity(argv.len() + 1);
+        let mut used_placeholder = false;
+
+        for arg in argv {
+            if arg.contains("{{text}}") {
+                rendered.push(arg.replace("{{text}}", text));
+                used_placeholder = true;
+            } else {
+                rendered.push(arg.clone());
+            }
+        }
+
+        if !used_placeholder {
+            rendered.push(text.to_string());
+        }
+
+        rendered
+    }
 
     #[test]
     fn renders_text_placeholder() {
@@ -449,6 +483,31 @@ mod tests {
             render_text_command(&argv, "hello"),
             vec!["some-tool".to_string(), "hello".to_string()]
         );
+    }
+
+    #[test]
+    fn adds_sensitive_flag_for_wl_copy_probe_writes() {
+        let argv = vec!["wl-copy".into(), "--trim-newline".into()];
+        assert_eq!(
+            with_wl_copy_sensitive_flag(&argv),
+            Some(vec![
+                "wl-copy".to_string(),
+                "--sensitive".to_string(),
+                "--trim-newline".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn leaves_non_wl_copy_commands_unchanged() {
+        let argv = vec!["custom-copy".into(), "--flag".into()];
+        assert_eq!(with_wl_copy_sensitive_flag(&argv), None);
+    }
+
+    #[test]
+    fn does_not_duplicate_sensitive_flag() {
+        let argv = vec!["wl-copy".into(), "--sensitive".into()];
+        assert_eq!(with_wl_copy_sensitive_flag(&argv), None);
     }
 
     #[tokio::test]

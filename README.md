@@ -1,113 +1,214 @@
 # papagaia
 
-`papagaia` is a small Linux Wayland desktop utility for local dictation and
-selection-based text transformation.
+Write with your voice. Rewrite with a shortcut.
 
-It is intentionally:
+Papagaia is a lightweight writing helper for Linux Wayland desktops, inspired by tools like Wispr Flow. It helps you get polished words onto the screen faster: speak naturally, clean up rough drafts, fix grammar, shorten text, and rewrite selections without leaving the app you are already using.
+
+It is built for people who want a fast, keyboard-first writing flow on Linux: trigger a command from your compositor, talk or select text, and let Papagaia handle the cleanup.
+
+- Turn speech into clean, ready-to-send writing
+- Rewrite selected text with saved or ad-hoc prompts
+- Stay in your current app instead of bouncing between tools
+- Fit naturally into keyboard-driven Wayland workflows
+- Bring your own speech-to-text CLI, LLM CLI, and input tools
+
+Papagaia is intentionally:
 
 - Linux-only
-- Wayland-native
-- small and explicit
-- tuned for compositor keybinds that spawn commands
+- Wayland-only
+- focused on writing, editing, and dictation
+- designed around compositor shortcuts and small CLI commands
+- agnostic about the tools behind the workflow
 
-It was designed around Niri, but the overall model is generic: keep a small
-daemon running, then trigger actions from your compositor with a tiny CLI.
+## What Papagaia Is
 
-## Architecture
+It focuses on two everyday jobs:
 
-The workspace is split into three binaries:
+1. Transform the current selection with a prompt, then paste the result back into the active application.
+2. Record speech, transcribe it locally, and type the final text into the focused application.
 
-- `papagaia-daemon`: long-lived Rust daemon for clipboard orchestration, subprocess execution, recording, whisper.cpp transcription, and overlay coordination
-- `papagaia`: tiny CLI client that compositor keybinds can spawn
-- `papagaia-overlay`: tiny GTK4 + layer-shell HUD for recording and loading feedback
+In practice, that means you can draft with your voice, polish rough text instantly, and keep momentum while writing emails, notes, docs, commits, chat replies, or anything else that lives in a text box.
 
-## Runtime Dependencies
+For prompt-based transformations, Papagaia delegates to whatever CLI tool you configure under `[engine]`. For dictation, it runs whatever speech-to-text command you configure under `[whisper]`. That means you can use `whisper.cpp`, a wrapper around `faster-whisper`, `whisperx`, or another CLI entirely, as long as it fits the configured command contract.
 
-Core tools:
+## Why You Might Want It
 
-- `wl-clipboard`
-- `wtype`
+- You want to write faster without treating dictation as a separate app.
+- You like the idea of Wispr Flow-style voice writing, but want something Linux- and Wayland-friendly.
+- You want selection-based actions like "fix grammar", "shorten", or "rewrite clearly" available anywhere.
+- You want local microphone transcription without depending entirely on a cloud dictation product.
+- You want to mix and match your own speech, LLM, and input tooling instead of adopting a closed stack.
+- You prefer tools that are small, inspectable, and easy to bind into your existing desktop workflow.
 
-Dictation tools:
+## How It Works
 
-- `whisper.cpp` (`whisper-cli`)
-- a local Whisper model file such as `ggml-base.bin`
+Papagaia uses a simple three-part model:
 
-Prompt engine:
+- `papagaia-daemon` stays alive in the background and does the actual work.
+- `papagaia` is the tiny CLI you bind to shortcuts or run from the terminal.
+- `papagaia-overlay` is a small HUD used for recording and status feedback.
 
-- one CLI of your choice, configured in `[engine]`
+For text transformation, the daemon follows a pragmatic Wayland path:
 
-Overlay build dependency:
+1. Trigger copy in the focused app.
+2. Read the clipboard.
+3. Render the selected text into a saved or ad-hoc prompt.
+4. Run the configured engine command.
+5. Paste or type the result back into the focused app.
 
-- `gtk4-layer-shell` and the usual GTK4 development libraries
+For dictation, the daemon records audio, runs your configured speech-to-text command, and types the final text into the focused application. Optional post-processing can clean up punctuation, capitalization, filler words, and formatting.
 
-## Build
+## Build / Install
 
-```bash
-cargo build
-```
-
-## Setup
-
-Generate a starter config based on what `papagaia` can detect on your machine:
-
-```bash
-cargo run -p papagaia-cli -- init
-```
-
-`init` tries to auto-select an engine from installed tools such as `gemini`,
-`codex`, `claude`, GitHub Copilot (`gh copilot`), or `llama.cpp` (`llama-cli`).
-
-If you want to overwrite an existing config:
+Build the whole workspace first:
 
 ```bash
-cargo run -p papagaia-cli -- init --force
+cargo build --release
 ```
 
-Then inspect the environment:
+That gives you these binaries in `target/release/`:
+
+- `papagaia`
+- `papagaia-daemon`
+- `papagaia-overlay`
+
+For a local development flow, running through `cargo run` is also fine. For a more permanent setup, make sure the binaries are available on your `PATH` or live together in the same directory so `papagaia init` can find `papagaia-daemon`.
+
+## Quick Start
+
+1. Build the workspace.
 
 ```bash
-cargo run -p papagaia-cli -- doctor
+cargo build --release
 ```
 
-The config lives at:
-
-```text
-~/.config/papagaia/config.toml
-```
-
-## First Run
-
-Start the daemon:
+2. Generate a starter config.
 
 ```bash
-cargo run -p papagaia-daemon
+./target/release/papagaia init
 ```
 
-Then send commands from another shell:
+`papagaia init` writes `~/.config/papagaia/config.toml`, seeds a default prompt set, chooses sensible starter commands, tries to detect a usable engine, and attempts to install and start a systemd user service for `papagaia-daemon`.
+
+3. Check your environment.
 
 ```bash
-cargo run -p papagaia-cli -- status
-cargo run -p papagaia-cli -- prompt list
-cargo run -p papagaia-cli -- prompt run fix-grammar
-cargo run -p papagaia-cli -- prompt raw --text 'Rewrite this more clearly: {{text}}'
-cargo run -p papagaia-cli -- dictate toggle
+./target/release/papagaia doctor
 ```
 
-## Generic Wayland Usage
+This is the fastest way to see whether Papagaia can find your configured clipboard tools, typing backend, engine command, speech-to-text command, model path, and daemon service.
 
-The intended interaction model is simple:
+4. Confirm the daemon is available.
 
-1. Start `papagaia-daemon` once in your session.
-2. Bind compositor shortcuts that spawn `papagaia` commands.
-3. Let `papagaia` do copy -> transform -> replace or record -> transcribe -> type.
+```bash
+./target/release/papagaia status
+```
 
-Any compositor that can launch shell commands from keybinds should be able to
-use this model.
+If systemd setup was skipped or failed, start the daemon manually in another terminal:
 
-## Niri Example
+```bash
+./target/release/papagaia-daemon
+```
 
-Niri is a particularly good fit because its keybinds naturally spawn commands:
+5. Try a saved prompt.
+
+```bash
+./target/release/papagaia prompt list
+./target/release/papagaia prompt run fix-grammar
+```
+
+6. Try dictation.
+
+```bash
+./target/release/papagaia dictate toggle
+```
+
+At this point, the usual next step is to bind these commands in your compositor.
+
+## Everyday Usage
+
+### Saved Prompts
+
+List your configured prompt templates:
+
+```bash
+papagaia prompt list
+```
+
+Run one against the current selection:
+
+```bash
+papagaia prompt run shorten
+papagaia prompt run fix-grammar
+```
+
+If a prompt runs while text is selected, Papagaia captures the selection, sends it through the configured engine, and replaces the selection with the result.
+
+### Ad-hoc Prompts
+
+Run a one-off prompt from the command line:
+
+```bash
+papagaia prompt raw --text 'Rewrite this more clearly: {{text}}'
+papagaia prompt raw --text 'Summarize this in one sentence: {{text}}'
+```
+
+You can also pipe the prompt template over stdin:
+
+```bash
+printf 'Fix grammar and return only the corrected text: {{text}}' | papagaia prompt raw --stdin
+```
+
+If an ad-hoc prompt does not include `{{text}}` or `{{selection}}`, Papagaia automatically appends the selected text to the prompt.
+
+### Prompt Picker
+
+Open the overlay picker:
+
+```bash
+papagaia prompt pick
+```
+
+You can select a saved prompt from the list, or type plain text to run an ad-hoc prompt directly from the picker.
+
+### Streaming Output
+
+Some prompts work better when output is typed into the target app as it is generated:
+
+```bash
+papagaia prompt raw \
+  --text 'Fix grammar and return only the corrected text: {{text}}' \
+  --stream-output \
+  --strip-markdown-fences false
+```
+
+Streaming uses the configured `type_command` instead of the clipboard paste path.
+
+Important constraints:
+
+- Streaming works best with engines that flush stdout progressively.
+- Streaming prompts cannot use `strip_markdown_fences = true`.
+- While streaming is active, focus stays in the target application so text can be typed incrementally.
+
+### Dictation
+
+Papagaia supports both toggle-style and explicit start/stop dictation:
+
+```bash
+papagaia dictate toggle
+papagaia dictate start
+papagaia dictate stop
+```
+
+By default, Papagaia transcribes audio with the command configured in `[whisper]` and types the final text into the focused application with the command configured in `[tools].type_command`. If `[dictation].post_process = true`, the transcript is also refined through your configured engine before it is typed.
+
+Those defaults are not special. If you prefer a different speech-to-text CLI or different typing/input commands, you can replace them in the config.
+
+## Compositor Integration
+
+Papagaia is designed for compositors that can spawn commands from keybindings. Niri is a particularly good fit, but the overall model is generic.
+
+Example Niri bindings:
 
 ```kdl
 binds {
@@ -117,69 +218,68 @@ binds {
 }
 ```
 
-If you prefer press/release push-to-talk semantics, bind `dictate start` on key
-press and `dictate stop` on release if your compositor supports that split.
+If your compositor supports press/release bindings, you can use push-to-talk semantics with:
 
-## Prompt Commands
+- `papagaia dictate start` on key press
+- `papagaia dictate stop` on key release
 
-Use the prompt helper command when you want to inspect saved prompt templates or
-run an ad-hoc one:
+The same command model should work with any Wayland compositor that can launch shell commands from shortcuts.
 
-```bash
-papagaia prompt list
-papagaia prompt run shorten
-papagaia prompt raw --text 'Refactor this code and return only the final code: {{text}}'
-papagaia prompt raw --text 'Fix grammar and return only the corrected text: {{text}}' --stream-output --strip-markdown-fences false
-printf 'Summarize this in one sentence: {{text}}' | papagaia prompt raw --stdin
-```
+## Configuration Overview
 
-If an ad-hoc prompt does not contain `{{text}}` or `{{selection}}`, `papagaia`
-appends the selected text automatically.
-
-In the picker, typing plain text still runs a normal ad-hoc prompt. To run an
-ad-hoc prompt with streaming from the picker, just type it directly, for
-example:
+The config file lives at:
 
 ```text
-Fix grammar and return only the corrected text: {{text}}
+~/.config/papagaia/config.toml
 ```
 
-## Streaming Output
+Print the exact path on your machine with:
 
-If you want the model output to be typed into the focused app while it is still
-being generated, enable `stream_output` on that prompt:
-
-```toml
-[[prompts]]
-name = "fix-grammar-live"
-template = """
-Correct grammar, spelling, and punctuation in the following text.
-Return only the corrected text.
-
-{{text}}
-"""
-strip_markdown_fences = false
-trim_whitespace = true
-stream_output = true
+```bash
+papagaia config-path
 ```
 
-With `stream_output = true`, `papagaia` switches from the usual clipboard paste
-path to the configured `type_command` and injects text incrementally as the
-engine prints to stdout.
+The main sections are:
 
-Notes:
+- `[tools]`: commands for reading the clipboard, writing the clipboard, simulating copy/paste, typing text, and clipboard timing.
+- `[whisper]`: the speech-to-text command and model-related arguments used for dictation. The starter config uses `whisper.cpp`, but this section is intentionally generic.
+- `[dictation]`: transcript post-processing, streaming behavior, focused-window context capture, and audio-debugging options.
+- `[engine]`: the CLI command used for text transformation and optional dictation post-processing.
+- `[[prompts]]`: saved prompt templates and their output-cleanup options.
 
-- This works best with CLIs that already flush text progressively, such as `gemini`.
-- Streaming prompts cannot use `strip_markdown_fences = true`, because fence removal needs the full final response.
-- While streaming is active, the overlay does not grab the keyboard; if you want a dedicated cancel shortcut, bind `papagaia cancel` in your compositor.
-- Ad-hoc calls can stream too: `papagaia prompt raw --text '...' --stream-output --strip-markdown-fences false`.
-- Picker ad-hoc text streams by default.
+`papagaia init` tries to generate sensible defaults for your machine. It can auto-detect engines such as `codex`, `claude`, GitHub Copilot through `gh copilot`, `llama.cpp`, and `gemini` when those tools are installed.
 
-## Notes
+The important design point is that Papagaia is an orchestrator, not a closed AI stack. You can bring your own:
 
-- Replacement currently uses the pragmatic Wayland path: simulate copy, read the clipboard, run the transform, write the replacement to the clipboard, simulate paste.
-- Dictation writes final text into the focused app with `wtype`.
-- The transform setup is a single configurable `[engine]` plus prompt templates in TOML.
-- `papagaia doctor` is the quickest way to see what a new machine is still missing.
-- `papagaia init` is the quickest way to generate a reasonable first config for a new machine.
-- `wtype` is the default text injection backend; `ydotool` can still be configured manually if you need it.
+- speech-to-text CLI
+- LLM CLI
+- clipboard tools
+- copy/paste injection commands
+- text typing backend
+
+## Troubleshooting
+
+If something feels off, start with:
+
+```bash
+papagaia doctor
+```
+
+It reports missing commands, model paths, daemon state, and systemd service status.
+
+Common issues:
+
+- `wl-copy` or `wl-paste` missing: install `wl-clipboard`.
+- `wtype` missing: install `wtype`, or configure `[tools]` to use `ydotool` instead.
+- `ydotool` configured but not working: make sure `ydotoold` is installed and running.
+- `whisper-cli` missing: install `whisper.cpp`, or replace `[whisper].argv` with the speech-to-text command you actually want to use.
+- Whisper model path missing or wrong: update `[whisper].model` to point at a local model file if your chosen speech pipeline expects one.
+- Engine command missing: install the configured CLI tool or update `[engine].argv`.
+- `papagaia status` shows `stopped`: start `papagaia-daemon` manually or enable the systemd user service.
+- `papagaia init` skips systemd setup: make sure `papagaia-daemon` is built and discoverable on your `PATH`, then run `papagaia init --force` again if needed.
+
+If you are using the systemd user service and change your setup, you can restart it with:
+
+```bash
+papagaia restart
+```

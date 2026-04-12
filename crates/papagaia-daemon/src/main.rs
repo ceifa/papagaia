@@ -5,13 +5,7 @@ mod dictation;
 mod llm;
 mod overlay;
 
-use std::{
-    fs,
-    io::ErrorKind,
-    os::unix::fs::FileTypeExt,
-    path::Path,
-    sync::Arc,
-};
+use std::{fs, io::ErrorKind, os::unix::fs::FileTypeExt, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use app::App;
@@ -75,7 +69,12 @@ fn prepare_socket_path(socket_path: &Path) -> Result<()> {
             "papagaia-daemon is already running at {}",
             socket_path.display()
         ),
-        Err(error) if matches!(error.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound) => {
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::ConnectionRefused | ErrorKind::NotFound
+            ) =>
+        {
             fs::remove_file(socket_path).with_context(|| {
                 format!("failed to remove stale socket {}", socket_path.display())
             })?;

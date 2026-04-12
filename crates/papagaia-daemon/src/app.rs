@@ -680,7 +680,8 @@ impl App {
                 self.overlay.send(OverlayMessage::Hidden).await;
             }
         } else {
-            self.flash_result(overlay_epoch, false, error.to_string()).await;
+            self.flash_result(overlay_epoch, false, error.to_string())
+                .await;
         }
     }
 
