@@ -754,8 +754,11 @@ fn detect_engine_choices() -> Vec<EngineChoice> {
             argv: vec![
                 "codex".into(),
                 "exec".into(),
-                "--model".into(),
+                "-m".into(),
                 "gpt-5.4-mini".into(),
+                "--ephemeral".into(),
+                "-c".into(),
+                "model_reasoning_effort=none".into(),
                 "{{prompt}}".into(),
             ],
         });
@@ -766,6 +769,9 @@ fn detect_engine_choices() -> Vec<EngineChoice> {
             name: "claude",
             argv: vec![
                 "claude".into(),
+                "--disable-slash-commands".into(),
+                "--effort".into(),
+                "low".into(),
                 "-p".into(),
                 "--model".into(),
                 "haiku".into(),
@@ -989,7 +995,16 @@ mod tests {
             whisper_model: Some("/tmp/model.bin".into()),
             engine_choices: vec![EngineChoice {
                 name: "codex",
-                argv: vec!["codex".into(), "exec".into(), "{{prompt}}".into()],
+                argv: vec![
+                    "codex".into(),
+                    "exec".into(),
+                    "-m".into(),
+                    "gpt-5.4-mini".into(),
+                    "--ephemeral".into(),
+                    "-c".into(),
+                    "model_reasoning_effort=none".into(),
+                    "{{prompt}}".into(),
+                ],
             }],
             niri: true,
             hyprland: false,
@@ -997,7 +1012,9 @@ mod tests {
 
         let config = render_init_config(&environment);
         assert!(config.contains("model = \"/tmp/model.bin\""));
-        assert!(config.contains("argv = [\"codex\", \"exec\", \"{{prompt}}\"]"));
+        assert!(config.contains(
+            "argv = [\"codex\", \"exec\", \"-m\", \"gpt-5.4-mini\", \"--ephemeral\", \"-c\", \"model_reasoning_effort=none\", \"{{prompt}}\"]"
+        ));
         assert!(config.contains("[dictation]"));
         assert!(
             config
