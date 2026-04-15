@@ -3,7 +3,7 @@ mod systemd;
 use std::{
     fs,
     io::ErrorKind,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, IsTerminal, Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     thread,
@@ -96,6 +96,11 @@ struct DetectedEnvironment {
 struct EngineChoice {
     name: &'static str,
     argv: Vec<String>,
+}
+
+struct InitOptions {
+    chosen_engine: Option<EngineChoice>,
+    post_process: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -310,38 +315,65 @@ fn run_restart() -> Result<()> {
 
 fn run_init(force: bool, no_backup: bool) -> Result<()> {
     let config_path = papagaia_core::config_path()?;
+
+    if config_path.exists() && !force {
+        bail!(
+            "config already exists at {}. Re-run with `papagaia init --force` to overwrite it.",
+            config_path.display()
+        );
+    }
+
     let environment = detect_environment();
-    let config_text = render_init_config(&environment);
+    let interactive = io::stdin().is_terminal();
+
+    print_detection_summary(&environment);
+
+    let chosen_engine = if interactive {
+        choose_engine_interactive(&environment.engine_choices)?
+    } else {
+        environment.engine_choices.first().cloned()
+    };
+
+    let post_process = if chosen_engine.is_some() {
+        if interactive {
+            ask_yes_no(
+                "Enable post-processing of dictation through the LLM engine?",
+                true,
+            )?
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+
+    let options = InitOptions {
+        chosen_engine,
+        post_process,
+    };
+
+    let config_text = render_init_config(&environment, &options);
 
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    if config_path.exists() {
-        if !force {
-            bail!(
-                "config already exists at {}. Re-run with `papagaia init --force` to overwrite it.",
-                config_path.display()
-            );
-        }
-
-        if !no_backup {
-            let backup = config_backup_path(&config_path)?;
-            fs::copy(&config_path, &backup).with_context(|| {
-                format!(
-                    "failed to create config backup from {} to {}",
-                    config_path.display(),
-                    backup.display()
-                )
-            })?;
-            println!("Backed up existing config to {}", backup.display());
-        }
+    if config_path.exists() && !no_backup {
+        let backup = config_backup_path(&config_path)?;
+        fs::copy(&config_path, &backup).with_context(|| {
+            format!(
+                "failed to create config backup from {} to {}",
+                config_path.display(),
+                backup.display()
+            )
+        })?;
+        println!("Backed up existing config to {}", backup.display());
     }
 
     fs::write(&config_path, config_text)
         .with_context(|| format!("failed to write {}", config_path.display()))?;
-    println!("Wrote {}", config_path.display());
+    println!("\nWrote {}", config_path.display());
 
     match systemd::install() {
         Ok(unit_path) => {
@@ -356,8 +388,109 @@ fn run_init(force: bool, no_backup: bool) -> Result<()> {
         }
     }
 
-    println!("Run `papagaia doctor` next to verify commands and paths.");
+    println!("\nRun `papagaia doctor` next to verify commands and paths.");
     Ok(())
+}
+
+fn print_detection_summary(env: &DetectedEnvironment) {
+    println!("Detected environment:");
+    println!(
+        "  clipboard:     wl-copy={}, wl-paste={}",
+        yes_no(env.wl_copy),
+        yes_no(env.wl_paste)
+    );
+    println!(
+        "  input:         wtype={}, ydotool={}",
+        yes_no(env.wtype),
+        yes_no(env.ydotool)
+    );
+    println!(
+        "  whisper:       {}",
+        if env.whisper_cli { "yes" } else { "no" }
+    );
+    if let Some(model) = &env.whisper_model {
+        println!("  whisper model: {}", model.display());
+    }
+    println!(
+        "  compositor:    {}",
+        if env.niri {
+            "niri"
+        } else if env.hyprland {
+            "hyprland"
+        } else {
+            "unknown"
+        }
+    );
+    if env.engine_choices.is_empty() {
+        println!("  engines:       none");
+    } else {
+        let names: Vec<&str> = env.engine_choices.iter().map(|c| c.name).collect();
+        println!("  engines:       {}", names.join(", "));
+    }
+    println!();
+}
+
+fn choose_engine_interactive(choices: &[EngineChoice]) -> Result<Option<EngineChoice>> {
+    if choices.is_empty() {
+        println!("No LLM engines detected on PATH.");
+        println!("You will need to configure the [engine] section manually after init.\n");
+        return Ok(None);
+    }
+
+    if choices.len() == 1 {
+        if ask_yes_no(&format!("Use {} as the engine?", choices[0].name), true)? {
+            return Ok(Some(choices[0].clone()));
+        }
+        return Ok(None);
+    }
+
+    println!("Select an LLM engine:");
+    for (i, choice) in choices.iter().enumerate() {
+        println!("  [{}] {}", i + 1, choice.name);
+    }
+    println!("  [0] none (configure manually)");
+
+    loop {
+        print!("Choice [1-{}]: ", choices.len());
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+
+        if input.is_empty() {
+            println!("Using {}.\n", choices[0].name);
+            return Ok(Some(choices[0].clone()));
+        }
+
+        if let Ok(n) = input.parse::<usize>() {
+            if n == 0 {
+                return Ok(None);
+            }
+            if n >= 1 && n <= choices.len() {
+                println!("Using {}.\n", choices[n - 1].name);
+                return Ok(Some(choices[n - 1].clone()));
+            }
+        }
+
+        println!("Please enter a number between 0 and {}.", choices.len());
+    }
+}
+
+fn ask_yes_no(question: &str, default: bool) -> Result<bool> {
+    let hint = if default { "[Y/n]" } else { "[y/N]" };
+    print!("{question} {hint} ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim().to_lowercase();
+
+    if input.is_empty() {
+        return Ok(default);
+    }
+
+    Ok(input.starts_with('y'))
 }
 
 fn run_doctor() -> Result<()> {
@@ -624,21 +757,21 @@ fn detect_environment() -> DetectedEnvironment {
     }
 }
 
-fn render_init_config(environment: &DetectedEnvironment) -> String {
+fn render_init_config(environment: &DetectedEnvironment, options: &InitOptions) -> String {
     let whisper_model = environment
         .whisper_model
         .as_ref()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "~/.local/share/whisper-models/ggml-base.bin".into());
     let (copy_command, paste_command, type_command) = preferred_input_commands(environment);
-    let engine_command = environment
-        .engine_choices
-        .first()
+    let engine_command = options
+        .chosen_engine
+        .as_ref()
         .map(|choice| toml_array_owned(&choice.argv))
         .unwrap_or_else(|| toml_array(&["your-llm-cli", "--prompt", "{{prompt}}"]));
-    let engine_comment = environment
-        .engine_choices
-        .first()
+    let engine_comment = options
+        .chosen_engine
+        .as_ref()
         .map(|choice| format!("# Auto-detected engine: {}\n", choice.name))
         .unwrap_or_else(|| {
             "# Configure this to whichever CLI you want to use for text transformation.\n".into()
@@ -650,6 +783,7 @@ fn render_init_config(environment: &DetectedEnvironment) -> String {
     } else {
         "[]".into()
     };
+    let post_process = if options.post_process { "true" } else { "false" };
 
     format!(
         r#"logging = false
@@ -674,7 +808,7 @@ capture_stdout = true
 # Post-process dictation through the LLM engine to clean up transcription.
 # When enabled, the whisper transcript is refined by the configured [engine]
 # before being typed into the focused window.
-post_process = false
+post_process = {post_process}
 stream_post_process = true
 post_process_template = """
 You are a voice-to-text post-processor. Your job is to turn raw speech transcription into clean, ready-to-use text.
@@ -694,7 +828,7 @@ Transcription:
 """
 # Capture the focused window title before recording starts.
 # This context is injected into the post-processing prompt via {{{{context}}}}.
-context_awareness = false
+context_awareness = true
 window_title_command = {window_title_command}
 
 {engine_comment}[engine]
@@ -981,11 +1115,26 @@ fn status_request() -> Result<ClientResponse> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DetectedEnvironment, EngineChoice, render_init_config};
+    use super::{DetectedEnvironment, EngineChoice, InitOptions, render_init_config};
 
-    #[test]
-    fn init_config_uses_detected_whisper_model() {
-        let environment = DetectedEnvironment {
+    fn test_engine() -> EngineChoice {
+        EngineChoice {
+            name: "codex",
+            argv: vec![
+                "codex".into(),
+                "exec".into(),
+                "-m".into(),
+                "gpt-5.4-mini".into(),
+                "--ephemeral".into(),
+                "-c".into(),
+                "model_reasoning_effort=none".into(),
+                "{{prompt}}".into(),
+            ],
+        }
+    }
+
+    fn test_environment() -> DetectedEnvironment {
+        DetectedEnvironment {
             wl_copy: true,
             wl_paste: true,
             wtype: true,
@@ -993,24 +1142,21 @@ mod tests {
             ydotoold: true,
             whisper_cli: true,
             whisper_model: Some("/tmp/model.bin".into()),
-            engine_choices: vec![EngineChoice {
-                name: "codex",
-                argv: vec![
-                    "codex".into(),
-                    "exec".into(),
-                    "-m".into(),
-                    "gpt-5.4-mini".into(),
-                    "--ephemeral".into(),
-                    "-c".into(),
-                    "model_reasoning_effort=none".into(),
-                    "{{prompt}}".into(),
-                ],
-            }],
+            engine_choices: vec![test_engine()],
             niri: true,
             hyprland: false,
+        }
+    }
+
+    #[test]
+    fn init_config_uses_detected_whisper_model() {
+        let environment = test_environment();
+        let options = InitOptions {
+            chosen_engine: Some(test_engine()),
+            post_process: true,
         };
 
-        let config = render_init_config(&environment);
+        let config = render_init_config(&environment, &options);
         assert!(config.contains("model = \"/tmp/model.bin\""));
         assert!(config.contains(
             "argv = [\"codex\", \"exec\", \"-m\", \"gpt-5.4-mini\", \"--ephemeral\", \"-c\", \"model_reasoning_effort=none\", \"{{prompt}}\"]"
@@ -1020,5 +1166,46 @@ mod tests {
             config
                 .contains("window_title_command = [\"niri\", \"msg\", \"-j\", \"focused-window\"]")
         );
+    }
+
+    #[test]
+    fn init_config_respects_post_process_option() {
+        let environment = test_environment();
+
+        let enabled = InitOptions {
+            chosen_engine: Some(test_engine()),
+            post_process: true,
+        };
+        let config = render_init_config(&environment, &enabled);
+        assert!(config.contains("post_process = true"));
+
+        let disabled = InitOptions {
+            chosen_engine: Some(test_engine()),
+            post_process: false,
+        };
+        let config = render_init_config(&environment, &disabled);
+        assert!(config.contains("post_process = false"));
+    }
+
+    #[test]
+    fn init_config_context_awareness_enabled_by_default() {
+        let environment = test_environment();
+        let options = InitOptions {
+            chosen_engine: Some(test_engine()),
+            post_process: false,
+        };
+        let config = render_init_config(&environment, &options);
+        assert!(config.contains("context_awareness = true"));
+    }
+
+    #[test]
+    fn init_config_no_engine_uses_placeholder() {
+        let environment = test_environment();
+        let options = InitOptions {
+            chosen_engine: None,
+            post_process: false,
+        };
+        let config = render_init_config(&environment, &options);
+        assert!(config.contains("\"your-llm-cli\""));
     }
 }

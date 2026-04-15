@@ -12,7 +12,10 @@ use tokio::{
     time::{Duration, sleep},
 };
 
-use crate::{cancel::CancelToken, clipboard, dictation::Recorder, llm, overlay::OverlayHandle};
+use crate::{
+    cancel::CancelToken, clipboard, dictation::Recorder, dictation::MAX_RECORDING_SECS, llm,
+    overlay::OverlayHandle,
+};
 
 macro_rules! log {
     ($config:expr, $($arg:tt)*) => {
@@ -86,7 +89,7 @@ impl App {
         self.config.read().expect("config lock poisoned").clone()
     }
 
-    pub async fn handle(&self, request: ClientRequest) -> Result<ClientResponse> {
+    pub async fn handle(self: &Arc<Self>, request: ClientRequest) -> Result<ClientResponse> {
         let config = self.config();
         log!(config, "[papagaia] request: {}", request_label(&request));
         match request {
@@ -396,7 +399,7 @@ impl App {
         Ok((cleaned, selected.is_some()))
     }
 
-    async fn dictate_start(&self) -> Result<ClientResponse> {
+    async fn dictate_start(self: &Arc<Self>) -> Result<ClientResponse> {
         let config = self.config();
 
         // Capture context before starting recording (while the target window
@@ -411,12 +414,13 @@ impl App {
             DictationContext::default()
         };
 
+        let overlay_epoch;
         {
             let mut state = self.state.lock().await;
             if !matches!(*state, State::Idle) {
                 bail!("papagaia is already busy");
             }
-            let overlay_epoch = self.next_overlay_epoch();
+            overlay_epoch = self.next_overlay_epoch();
 
             let (level_tx, mut level_rx) = mpsc::unbounded_channel();
             let recorder = Recorder::start(level_tx)?;
@@ -438,6 +442,14 @@ impl App {
                 overlay_epoch,
             });
         }
+
+        // Auto-cancel recording after the maximum duration to prevent
+        // runaway memory usage and enormous WAV files.
+        let app = self.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_secs(MAX_RECORDING_SECS)).await;
+            app.auto_stop_recording(overlay_epoch).await;
+        });
 
         self.overlay
             .send(OverlayMessage::Recording {
@@ -630,7 +642,37 @@ impl App {
         }
     }
 
-    async fn dictate_toggle(&self) -> Result<ClientResponse> {
+    async fn auto_stop_recording(&self, recording_epoch: u64) {
+        let was_recording = {
+            let mut state = self.state.lock().await;
+            match &*state {
+                State::Recording(session) if session.overlay_epoch == recording_epoch => {
+                    let old = std::mem::replace(&mut *state, State::Idle);
+                    if let State::Recording(session) = old {
+                        drop(session.recorder);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        };
+
+        if was_recording {
+            let config = self.config();
+            log!(
+                config,
+                "[dictate] auto-stopped: maximum recording duration reached"
+            );
+            self.flash_result(
+                recording_epoch,
+                false,
+                "Recording stopped: maximum duration reached",
+            )
+            .await;
+        }
+    }
+
+    async fn dictate_toggle(self: &Arc<Self>) -> Result<ClientResponse> {
         let is_recording = {
             let state = self.state.lock().await;
             matches!(*state, State::Recording(_))

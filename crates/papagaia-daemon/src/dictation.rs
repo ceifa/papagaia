@@ -26,6 +26,8 @@ impl Recorder {
 
         let sample_rate = supported_config.sample_rate().0;
         let channels = supported_config.channels();
+        let max_samples =
+            sample_rate as usize * channels as usize * MAX_RECORDING_SECS as usize;
         let samples = Arc::new(Mutex::new(Vec::new()));
         let samples_for_callback = samples.clone();
         let level_tx_f32 = level_tx.clone();
@@ -38,7 +40,7 @@ impl Recorder {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _| {
-                    push_f32_samples(data, &samples_for_callback, &level_tx_f32);
+                    push_f32_samples(data, &samples_for_callback, &level_tx_f32, max_samples);
                 },
                 error_callback,
                 None,
@@ -46,7 +48,7 @@ impl Recorder {
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &stream_config,
                 move |data: &[i16], _| {
-                    push_i16_samples(data, &samples_for_callback, &level_tx_i16);
+                    push_i16_samples(data, &samples_for_callback, &level_tx_i16, max_samples);
                 },
                 error_callback,
                 None,
@@ -54,7 +56,7 @@ impl Recorder {
             cpal::SampleFormat::U16 => device.build_input_stream(
                 &stream_config,
                 move |data: &[u16], _| {
-                    push_u16_samples(data, &samples_for_callback, &level_tx_u16);
+                    push_u16_samples(data, &samples_for_callback, &level_tx_u16, max_samples);
                 },
                 error_callback,
                 None,
@@ -109,6 +111,7 @@ impl Recorder {
 }
 
 const WHISPER_SAMPLE_RATE: u32 = 16000;
+pub const MAX_RECORDING_SECS: u64 = 3600; // 1 hour
 
 fn prepare_for_whisper(interleaved: &[i16], channels: u16, sample_rate: u32) -> Vec<i16> {
     let mono = downmix_to_mono(interleaved, channels);
@@ -162,41 +165,53 @@ fn push_f32_samples(
     data: &[f32],
     samples: &Arc<Mutex<Vec<i16>>>,
     level_tx: &mpsc::UnboundedSender<f32>,
+    max_samples: usize,
 ) {
     let converted: Vec<i16> = data
         .iter()
         .map(|sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
         .collect();
-    push_samples(&converted, samples, level_tx);
+    push_samples(&converted, samples, level_tx, max_samples);
 }
 
 fn push_i16_samples(
     data: &[i16],
     samples: &Arc<Mutex<Vec<i16>>>,
     level_tx: &mpsc::UnboundedSender<f32>,
+    max_samples: usize,
 ) {
-    push_samples(data, samples, level_tx);
+    push_samples(data, samples, level_tx, max_samples);
 }
 
 fn push_u16_samples(
     data: &[u16],
     samples: &Arc<Mutex<Vec<i16>>>,
     level_tx: &mpsc::UnboundedSender<f32>,
+    max_samples: usize,
 ) {
     let converted: Vec<i16> = data
         .iter()
         .map(|sample| (*sample as i32 - i16::MAX as i32 - 1) as i16)
         .collect();
-    push_samples(&converted, samples, level_tx);
+    push_samples(&converted, samples, level_tx, max_samples);
 }
 
 fn push_samples(
     data: &[i16],
     samples: &Arc<Mutex<Vec<i16>>>,
     level_tx: &mpsc::UnboundedSender<f32>,
+    max_samples: usize,
 ) {
     if let Ok(mut collected) = samples.lock() {
-        collected.extend_from_slice(data);
+        let current = collected.len();
+        if current < max_samples {
+            let remaining = max_samples - current;
+            if data.len() <= remaining {
+                collected.extend_from_slice(data);
+            } else {
+                collected.extend_from_slice(&data[..remaining]);
+            }
+        }
     }
 
     if !data.is_empty() {
