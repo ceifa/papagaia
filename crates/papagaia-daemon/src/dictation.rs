@@ -74,7 +74,8 @@ impl Recorder {
         })
     }
 
-    pub fn finish(self) -> Result<PathBuf> {
+    /// Stops recording and writes a WAV file. Returns the path and duration in seconds.
+    pub fn finish(self) -> Result<(PathBuf, f64)> {
         drop(self.stream);
 
         let audio_path = std::env::temp_dir().join(format!(
@@ -90,6 +91,7 @@ impl Recorder {
         };
 
         let prepared = prepare_for_whisper(&samples, self.channels, self.sample_rate);
+        let duration_secs = prepared.len() as f64 / WHISPER_SAMPLE_RATE as f64;
 
         let spec = hound::WavSpec {
             channels: 1,
@@ -106,7 +108,7 @@ impl Recorder {
         }
         writer.finalize()?;
 
-        Ok(audio_path)
+        Ok((audio_path, duration_secs))
     }
 }
 

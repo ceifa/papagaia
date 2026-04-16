@@ -500,7 +500,11 @@ impl App {
         let config = self.config();
         let overlay = self.overlay.clone();
         let outcome = async {
-            let audio_path = recorder.finish()?;
+            let (audio_path, duration_secs) = recorder.finish()?;
+            if duration_secs < 2.0 {
+                maybe_remove_audio(&config, &audio_path);
+                bail!("recording too short ({duration_secs:.1}s), ignoring");
+            }
             let transcript = llm::run_whisper(&config.whisper, &audio_path, &cancel).await?;
             let cleaned = transcript.trim().to_string();
             log!(config, "[dictate] whisper transcript: {cleaned}");
