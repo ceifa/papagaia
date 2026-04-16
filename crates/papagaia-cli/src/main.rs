@@ -375,6 +375,23 @@ fn run_init(force: bool, no_backup: bool) -> Result<()> {
         .with_context(|| format!("failed to write {}", config_path.display()))?;
     println!("\nWrote {}", config_path.display());
 
+    if options
+        .chosen_engine
+        .as_ref()
+        .is_some_and(|e| e.name == "codex")
+    {
+        let instructions_path = config_path
+            .parent()
+            .expect("config path has a parent")
+            .join("codex_instructions.md");
+        fs::write(
+            &instructions_path,
+            "You transform text. Output only the transformed text, no preamble or explanation.\n",
+        )
+        .with_context(|| format!("failed to write {}", instructions_path.display()))?;
+        println!("Wrote {}", instructions_path.display());
+    }
+
     match systemd::install() {
         Ok(unit_path) => {
             println!("Installed systemd user unit at {}", unit_path.display());
@@ -894,6 +911,34 @@ fn detect_engine_choices() -> Vec<EngineChoice> {
                 "--skip-git-repo-check".into(),
                 "-c".into(),
                 "model_reasoning_effort=none".into(),
+                "-c".into(),
+                "model_verbosity=low".into(),
+                "-c".into(),
+                "model_reasoning_summary=none".into(),
+                "-c".into(),
+                "hide_agent_reasoning=true".into(),
+                "-c".into(),
+                "model_instructions_file=\"~/.config/papagaia/codex_instructions.md\"".into(),
+                "-c".into(),
+                "sandbox_mode=read-only".into(),
+                "-c".into(),
+                "approval_policy=never".into(),
+                "-c".into(),
+                "include_environment_context=false".into(),
+                "-c".into(),
+                "skills.bundled.enabled=false".into(),
+                "--disable".into(),
+                "shell_tool".into(),
+                "--disable".into(),
+                "plugins".into(),
+                "--disable".into(),
+                "multi_agent".into(),
+                "--disable".into(),
+                "tool_suggest".into(),
+                "--disable".into(),
+                "fast_mode".into(),
+                "--disable".into(),
+                "undo".into(),
                 "{{prompt}}".into(),
             ],
         });
@@ -907,6 +952,14 @@ fn detect_engine_choices() -> Vec<EngineChoice> {
                 "--disable-slash-commands".into(),
                 "--effort".into(),
                 "low".into(),
+                "--tools".into(),
+                "".into(),
+                "--system-prompt".into(),
+                "You transform text. Output only the transformed text, no preamble or explanation.".into(),
+                "--no-session-persistence".into(),
+                "--exclude-dynamic-system-prompt-sections".into(),
+                "--setting-sources".into(),
+                "".into(),
                 "-p".into(),
                 "--model".into(),
                 "haiku".into(),
@@ -921,8 +974,15 @@ fn detect_engine_choices() -> Vec<EngineChoice> {
             argv: vec![
                 "gh".into(),
                 "copilot".into(),
+                "-s".into(),
                 "--model".into(),
-                "auto".into(),
+                "gpt-4.1".into(),
+                "--disable-builtin-mcps".into(),
+                "--no-custom-instructions".into(),
+                "--no-auto-update".into(),
+                "--no-ask-user".into(),
+                "--no-remote".into(),
+                "--no-color".into(),
                 "-p".into(),
                 "{{prompt}}".into(),
             ],
@@ -941,9 +1001,9 @@ fn detect_engine_choices() -> Vec<EngineChoice> {
             name: "gemini",
             argv: vec![
                 "gemini".into(),
-                "-p".into(),
                 "-m".into(),
                 "gemini-3.1-flash-lite-preview".into(),
+                "-p".into(),
                 "{{prompt}}".into(),
             ],
         });
@@ -1130,6 +1190,34 @@ mod tests {
                 "--skip-git-repo-check".into(),
                 "-c".into(),
                 "model_reasoning_effort=none".into(),
+                "-c".into(),
+                "model_verbosity=low".into(),
+                "-c".into(),
+                "model_reasoning_summary=none".into(),
+                "-c".into(),
+                "hide_agent_reasoning=true".into(),
+                "-c".into(),
+                "model_instructions_file=\"~/.config/papagaia/codex_instructions.md\"".into(),
+                "-c".into(),
+                "sandbox_mode=read-only".into(),
+                "-c".into(),
+                "approval_policy=never".into(),
+                "-c".into(),
+                "include_environment_context=false".into(),
+                "-c".into(),
+                "skills.bundled.enabled=false".into(),
+                "--disable".into(),
+                "shell_tool".into(),
+                "--disable".into(),
+                "plugins".into(),
+                "--disable".into(),
+                "multi_agent".into(),
+                "--disable".into(),
+                "tool_suggest".into(),
+                "--disable".into(),
+                "fast_mode".into(),
+                "--disable".into(),
+                "undo".into(),
                 "{{prompt}}".into(),
             ],
         }
@@ -1161,7 +1249,7 @@ mod tests {
         let config = render_init_config(&environment, &options);
         assert!(config.contains("model = \"/tmp/model.bin\""));
         assert!(config.contains(
-            "argv = [\"codex\", \"exec\", \"-m\", \"gpt-5.4-mini\", \"--ephemeral\", \"--skip-git-repo-check\", \"-c\", \"model_reasoning_effort=none\", \"{{prompt}}\"]"
+            "argv = [\"codex\", \"exec\", \"-m\", \"gpt-5.4-mini\", \"--ephemeral\", \"--skip-git-repo-check\", \"-c\", \"model_reasoning_effort=none\", \"-c\", \"model_verbosity=low\", \"-c\", \"model_reasoning_summary=none\", \"-c\", \"hide_agent_reasoning=true\", \"-c\", \"model_instructions_file=\\\"~/.config/papagaia/codex_instructions.md\\\"\", \"-c\", \"sandbox_mode=read-only\", \"-c\", \"approval_policy=never\", \"-c\", \"include_environment_context=false\", \"-c\", \"skills.bundled.enabled=false\", \"--disable\", \"shell_tool\", \"--disable\", \"plugins\", \"--disable\", \"multi_agent\", \"--disable\", \"tool_suggest\", \"--disable\", \"fast_mode\", \"--disable\", \"undo\", \"{{prompt}}\"]"
         ));
         assert!(config.contains("[dictation]"));
         assert!(

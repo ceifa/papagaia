@@ -758,7 +758,8 @@ impl App {
                 message: message.clone(),
             })
             .await;
-        sleep(Duration::from_millis(900)).await;
+        let duration = if ok { 900 } else { 3000 };
+        sleep(Duration::from_millis(duration)).await;
         if self.is_current_overlay_epoch(overlay_epoch) {
             self.overlay.send(OverlayMessage::Hidden).await;
         }
