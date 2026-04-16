@@ -85,10 +85,9 @@ impl Recorder {
                 .as_millis()
         ));
 
-        let samples = {
-            let guard = self.samples.lock().expect("recorder sample lock poisoned");
-            guard.clone()
-        };
+        let samples = Arc::try_unwrap(self.samples)
+            .map(|mutex| mutex.into_inner().expect("recorder sample lock poisoned"))
+            .unwrap_or_else(|arc| arc.lock().expect("recorder sample lock poisoned").clone());
 
         let prepared = prepare_for_whisper(&samples, self.channels, self.sample_rate);
         let duration_secs = prepared.len() as f64 / WHISPER_SAMPLE_RATE as f64;

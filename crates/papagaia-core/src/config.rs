@@ -291,6 +291,18 @@ pub fn socket_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("daemon.sock"))
 }
 
+pub fn overlay_program() -> PathBuf {
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        let sibling = parent.join("papagaia-overlay");
+        if sibling.exists() {
+            return sibling;
+        }
+    }
+    PathBuf::from("papagaia-overlay")
+}
+
 fn strip_outer_markdown_fence(text: &str) -> String {
     let trimmed = text.trim();
     if !trimmed.starts_with("```") || !trimmed.ends_with("```") {

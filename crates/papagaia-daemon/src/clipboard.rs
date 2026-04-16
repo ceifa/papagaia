@@ -189,49 +189,83 @@ where
     let mut stderr = child.stderr.take();
     let mut stdout_bytes = Vec::new();
     let mut pending_utf8 = Vec::new();
+
+    // Spawn a background waiter for the child PID so we can detect exit
+    // without polling try_wait() every 40ms.
+    let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+    if let Some(pid) = child.id() {
+        tokio::spawn(async move {
+            let status = tokio::task::spawn_blocking(move || {
+                use std::os::unix::process::ExitStatusExt;
+                let mut status: libc::c_int = 0;
+                loop {
+                    let ret = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+                    if ret == -1 {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                    return Ok(std::process::ExitStatus::from_raw(status));
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+            let _ = exit_tx.send(status);
+        });
+    }
+
     let mut exit_status = None;
 
-    while exit_status.is_none() {
-        if let Some(status) = child
-            .try_wait()
-            .with_context(|| format!("failed to poll {}", argv.join(" ")))?
-        {
-            exit_status = Some(status);
-            break;
-        }
-
-        // Read raw bytes inside the select! so cancellation and the periodic
-        // child.try_wait() poll stay responsive. The callback is deliberately
-        // invoked OUTSIDE the select!: tokio::select! drops the losing branch,
-        // and a slow callback (e.g. one that awaits wtype) would get cancelled
-        // mid-flight whenever the 40ms timer branch won the race.
+    // Read stdout chunks and invoke the callback outside of select! so slow
+    // callbacks (e.g. ones that await wtype) don't get dropped mid-flight.
+    loop {
         let bytes = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 let _ = child.start_kill();
-                let _ = child.wait().await;
+                let _ = exit_rx.await;
                 bail!("operation cancelled");
             }
+            result = &mut exit_rx, if exit_status.is_none() => {
+                match result {
+                    Ok(Ok(status)) => { exit_status = Some(status); continue; }
+                    Ok(Err(e)) => return Err(e).with_context(|| format!("failed to wait for {}", argv.join(" "))),
+                    Err(_) => continue,
+                }
+            }
             read = read_stdout_bytes(&mut stdout) => read?,
-            _ = sleep(Duration::from_millis(40)) => continue,
         };
 
-        if let Some(bytes) = bytes {
-            stdout_bytes.extend_from_slice(&bytes);
-            pending_utf8.extend_from_slice(&bytes);
-            flush_valid_utf8(&mut pending_utf8, &mut on_stdout).await?;
+        match bytes {
+            Some(bytes) => {
+                stdout_bytes.extend_from_slice(&bytes);
+                pending_utf8.extend_from_slice(&bytes);
+                flush_valid_utf8(&mut pending_utf8, &mut on_stdout).await?;
+            }
+            None if exit_status.is_some() => break,
+            None => {
+                // stdout closed but child hasn't exited yet; wait for exit.
+                if exit_status.is_none() {
+                    match exit_rx.await {
+                        Ok(Ok(status)) => { exit_status = Some(status); }
+                        Ok(Err(e)) => return Err(e).with_context(|| format!("failed to wait for {}", argv.join(" "))),
+                        Err(_) => {}
+                    }
+                }
+                break;
+            }
         }
     }
 
-    if exit_status.is_some() {
-        drain_streaming_stdout(
-            &mut stdout,
-            &mut stdout_bytes,
-            &mut pending_utf8,
-            &mut on_stdout,
-        )
-        .await?;
-    }
+    drain_streaming_stdout(
+        &mut stdout,
+        &mut stdout_bytes,
+        &mut pending_utf8,
+        &mut on_stdout,
+    )
+    .await?;
 
     if !pending_utf8.is_empty() {
         bail!("command produced invalid UTF-8 on stdout");
@@ -313,34 +347,59 @@ fn clipboard_probe_token() -> String {
 
 /// Wait for the child to exit, killing it if the cancel token fires.
 ///
-/// We can't use `tokio::select! { _ = child.wait() => .., _ = cancel.cancelled() => child.start_kill() }`
-/// directly: `child.wait()` holds a `&mut Child` borrow for the duration of
-/// the future, which the borrow checker doesn't release inside the sibling
-/// branch even though tokio drops the loser first. Polling `try_wait()` (a
-/// synchronous probe) sidesteps the borrow entirely — each iteration touches
-/// `child` only between await points.
+/// Spawns a background task to await the child exit, then `select!`s between
+/// the result and the cancel token. This avoids the borrow-checker issue with
+/// `child.wait()` inside `select!` and eliminates polling latency.
 async fn wait_or_cancel(
     child: &mut Child,
     cancel: &CancelToken,
     argv: &[String],
 ) -> Result<std::process::ExitStatus> {
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to poll {}", argv.join(" ")));
-            }
-        }
+    let id = child.id();
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let wait_argv = argv.join(" ");
+    // Take ownership via a raw waitpid so `child` remains accessible for kill.
+    tokio::spawn(async move {
+        let status = if let Some(pid) = id {
+            // Wait for the specific PID without holding &mut Child.
+            tokio::task::spawn_blocking(move || {
+                use std::os::unix::process::ExitStatusExt;
+                let mut status: libc::c_int = 0;
+                loop {
+                    let ret = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+                    if ret == -1 {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                    return Ok(std::process::ExitStatus::from_raw(status));
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+        } else {
+            Err(std::io::Error::other("child has no PID"))
+        };
+        let _ = tx.send(status);
+    });
 
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                bail!("operation cancelled");
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            let _ = child.start_kill();
+            // Still collect the exit status so the child doesn't become a zombie.
+            let _ = rx.await;
+            bail!("operation cancelled");
+        }
+        result = &mut rx => {
+            match result {
+                Ok(Ok(status)) => Ok(status),
+                Ok(Err(error)) => Err(error)
+                    .with_context(|| format!("failed to wait for {}", argv.join(" "))),
+                Err(_) => bail!("child wait task was dropped for {}", wait_argv),
             }
-            _ = sleep(Duration::from_millis(40)) => {}
         }
     }
 }
@@ -356,14 +415,24 @@ async fn drain_pipe<R: AsyncRead + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
         return Vec::new();
     };
     let mut buf = Vec::new();
+    // Try a non-blocking read first — for well-behaved commands the pipe
+    // closes with the child and this completes instantly. Only fall back to
+    // the 100ms timeout when the pipe is still open (e.g. wl-copy forks a
+    // background process that inherits the pipe).
+    let mut tmp = [0u8; 4096];
+    match pipe.read(&mut tmp).await {
+        Ok(0) => return buf,
+        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        Err(_) => return buf,
+    }
     match tokio::time::timeout(
-        Duration::from_millis(200),
+        Duration::from_millis(100),
         tokio::io::AsyncReadExt::read_to_end(pipe, &mut buf),
     )
     .await
     {
         Ok(Ok(_)) | Ok(Err(_)) => buf,
-        Err(_) => buf, // timeout — return what we have
+        Err(_) => buf,
     }
 }
 

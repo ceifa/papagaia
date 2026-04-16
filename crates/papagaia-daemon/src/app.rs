@@ -58,12 +58,6 @@ struct BusySession {
     overlay_epoch: u64,
 }
 
-struct RawPromptOptions {
-    strip_markdown_fences: bool,
-    trim_whitespace: bool,
-    stream_output: bool,
-}
-
 impl DictationContext {
     fn render_context_block(&self) -> String {
         if !self.window_title.is_empty() {
@@ -141,12 +135,47 @@ impl App {
         selected_text: Option<String>,
         preserve_selection: bool,
     ) -> Result<ClientResponse> {
-        let session = self
-            .enter_busy(format!("running prompt '{prompt_name}'"))
-            .await?;
+        let config = self.config();
+        let prompt = config.prompt(prompt_name)?.clone();
+        let label = format!("running prompt '{prompt_name}'");
+        let success_label = prompt_name.to_string();
+        self.run_transform(prompt, label, &success_label, selected_text, preserve_selection)
+            .await
+    }
+
+    async fn transform_raw(
+        &self,
+        template: &str,
+        selected_text: Option<String>,
+        preserve_selection: bool,
+        strip_markdown_fences: bool,
+        trim_whitespace: bool,
+        stream_output: bool,
+    ) -> Result<ClientResponse> {
+        let prompt = PromptConfig {
+            name: "ad-hoc".into(),
+            template: template.into(),
+            strip_markdown_fences,
+            trim_whitespace,
+            stream_output,
+        };
+        validate_prompt_options(&prompt)?;
+        self.run_transform(prompt, "running ad-hoc prompt".into(), "engine output", selected_text, preserve_selection)
+            .await
+    }
+
+    async fn run_transform(
+        &self,
+        prompt: PromptConfig,
+        busy_label: String,
+        success_label: &str,
+        selected_text: Option<String>,
+        preserve_selection: bool,
+    ) -> Result<ClientResponse> {
+        let session = self.enter_busy(busy_label).await?;
         let outcome = self
-            .transform_inner(
-                prompt_name,
+            .run_transform_inner(
+                &prompt,
                 selected_text.as_deref(),
                 preserve_selection,
                 &session.cancel,
@@ -158,9 +187,9 @@ impl App {
         match outcome {
             Ok((text, had_selection)) => {
                 let msg = if had_selection {
-                    format!("Replaced selection with {prompt_name}")
+                    format!("Replaced selection with {success_label}")
                 } else {
-                    format!("Pasted {prompt_name} output")
+                    format!("Pasted {success_label}")
                 };
                 log!(config, "[transform] {msg}");
                 self.flash_result(session.overlay_epoch, true, msg).await;
@@ -175,14 +204,14 @@ impl App {
         }
     }
 
-    async fn transform_inner(
+    async fn run_transform_inner(
         &self,
-        prompt_name: &str,
+        prompt: &PromptConfig,
         selected_text: Option<&str>,
         preserve_selection: bool,
         cancel: &CancelToken,
     ) -> Result<(String, bool)> {
-        let label = format!("Running {prompt_name}");
+        let label = format!("Running {}", prompt.name);
 
         // Capture phase: wtype needs the original window focused — no grab.
         self.overlay
@@ -193,7 +222,6 @@ impl App {
             .await;
 
         let config = self.config();
-        let prompt = config.prompt(prompt_name)?.clone();
         let selected = resolve_selected_text(
             &config.tools,
             &prompt.template,
@@ -232,7 +260,7 @@ impl App {
             stream_prompt_output(
                 &self.overlay,
                 &config.tools,
-                &prompt,
+                prompt,
                 &engine,
                 &rendered_prompt,
                 cancel,
@@ -257,145 +285,6 @@ impl App {
             cleaned
         };
         log!(config, "[transform] final output: {cleaned}");
-        Ok((cleaned, selected.is_some()))
-    }
-
-    async fn transform_raw(
-        &self,
-        template: &str,
-        selected_text: Option<String>,
-        preserve_selection: bool,
-        strip_markdown_fences: bool,
-        trim_whitespace: bool,
-        stream_output: bool,
-    ) -> Result<ClientResponse> {
-        let session = self.enter_busy("running ad-hoc prompt".into()).await?;
-        let options = RawPromptOptions {
-            strip_markdown_fences,
-            trim_whitespace,
-            stream_output,
-        };
-        let outcome = self
-            .transform_raw_inner(
-                template,
-                selected_text.as_deref(),
-                preserve_selection,
-                options,
-                &session.cancel,
-            )
-            .await;
-        self.leave_busy(session.overlay_epoch).await;
-
-        let config = self.config();
-        match outcome {
-            Ok((text, had_selection)) => {
-                let msg = if had_selection {
-                    "Replaced selection with engine output"
-                } else {
-                    "Pasted engine output"
-                };
-                log!(config, "[transform-raw] {msg}");
-                self.flash_result(session.overlay_epoch, true, msg).await;
-                Ok(ClientResponse::with_text("transform complete", text))
-            }
-            Err(error) => {
-                log!(config, "[transform-raw] error: {error:#}");
-                self.finish_error(session.overlay_epoch, &session.cancel, &error)
-                    .await;
-                Err(error)
-            }
-        }
-    }
-
-    async fn transform_raw_inner(
-        &self,
-        template: &str,
-        selected_text: Option<&str>,
-        preserve_selection: bool,
-        options: RawPromptOptions,
-        cancel: &CancelToken,
-    ) -> Result<(String, bool)> {
-        // Capture phase: wtype needs the original window focused — no grab.
-        self.overlay
-            .send(OverlayMessage::Busy {
-                label: "Running prompt".into(),
-                grab_keyboard: false,
-            })
-            .await;
-
-        let config = self.config();
-        let selected = resolve_selected_text(
-            &config.tools,
-            template,
-            selected_text,
-            preserve_selection,
-            true,
-            cancel,
-        )
-        .await?;
-
-        let prompt = PromptConfig {
-            name: "ad-hoc".into(),
-            template: template.into(),
-            strip_markdown_fences: options.strip_markdown_fences,
-            trim_whitespace: options.trim_whitespace,
-            stream_output: options.stream_output,
-        };
-        validate_prompt_options(&prompt)?;
-
-        // Engine phase: non-streaming prompts can grab the keyboard so Esc
-        // cancels the engine. Streaming prompts must keep focus in the target
-        // window because output is typed there incrementally.
-        self.overlay
-            .send(OverlayMessage::Busy {
-                label: "Running prompt".into(),
-                grab_keyboard: !prompt.stream_output,
-            })
-            .await;
-
-        let engine = config.engine().clone();
-        let rendered_prompt = match &selected {
-            Some(text) => prompt.render(text),
-            None => template.to_string(),
-        };
-        log!(
-            config,
-            "[transform-raw] stream={} strip_fences={} trim_ws={} selected={}",
-            options.stream_output,
-            options.strip_markdown_fences,
-            options.trim_whitespace,
-            selected.is_some()
-        );
-        log!(config, "[transform-raw] rendered prompt: {rendered_prompt}");
-        let cleaned = if prompt.stream_output {
-            stream_prompt_output(
-                &self.overlay,
-                &config.tools,
-                &prompt,
-                &engine,
-                &rendered_prompt,
-                cancel,
-            )
-            .await?
-        } else {
-            let raw = llm::run_engine(&engine, &rendered_prompt, cancel).await?;
-            log!(config, "[transform-raw] engine output: {raw}");
-            let cleaned = prompt.clean_output(&raw);
-
-            // Paste phase: release the grab so focus returns to the target window
-            // before wtype fires the paste shortcut.
-            self.overlay
-                .send(OverlayMessage::Busy {
-                    label: "Running prompt".into(),
-                    grab_keyboard: false,
-                })
-                .await;
-            sleep(Duration::from_millis(80)).await;
-
-            clipboard::paste_text(&config.tools, &cleaned, cancel).await?;
-            cleaned
-        };
-        log!(config, "[transform-raw] final output: {cleaned}");
         Ok((cleaned, selected.is_some()))
     }
 
@@ -464,28 +353,21 @@ impl App {
         let cancel = CancelToken::new();
         let (recorder, context, overlay_epoch) = {
             let mut state = self.state.lock().await;
-            match std::mem::replace(
-                &mut *state,
-                State::Busy {
-                    label: "transcribing".into(),
-                    cancel: cancel.clone(),
-                    overlay_epoch: 0,
-                },
-            ) {
-                State::Recording(session) => {
-                    let overlay_epoch = session.overlay_epoch;
-                    *state = State::Busy {
-                        label: "transcribing".into(),
-                        cancel: cancel.clone(),
-                        overlay_epoch,
-                    };
-                    (session.recorder, session.context, overlay_epoch)
-                }
-                other => {
-                    *state = other;
-                    bail!("papagaia is not recording");
-                }
+            if !matches!(*state, State::Recording(_)) {
+                bail!("papagaia is not recording");
             }
+            let State::Recording(session) =
+                std::mem::replace(&mut *state, State::Idle)
+            else {
+                unreachable!()
+            };
+            let overlay_epoch = session.overlay_epoch;
+            *state = State::Busy {
+                label: "transcribing".into(),
+                cancel: cancel.clone(),
+                overlay_epoch,
+            };
+            (session.recorder, session.context, overlay_epoch)
         };
 
         // Transcribe phase: whisper reads the WAV file, no foreign focus needed,
@@ -1071,14 +953,21 @@ fn compute_stream_delta(emitted: &str, chunk: &str) -> String {
         return rest.to_string();
     }
 
+    // Find the longest suffix of `emitted` that is a prefix of `chunk`.
+    // Walk backwards through chunk's char boundaries to find the first
+    // (longest) match, avoiding the O(n*m) scan of the old approach.
+    let emitted_bytes = emitted.as_bytes();
+    let chunk_bytes = chunk.as_bytes();
+    let max_overlap = emitted_bytes.len().min(chunk_bytes.len());
+
     let mut overlap = 0;
-    for (idx, _) in chunk.char_indices().skip(1) {
-        if emitted.ends_with(&chunk[..idx]) {
-            overlap = idx;
+    for len in (1..=max_overlap).rev() {
+        if emitted_bytes.ends_with(&chunk_bytes[..len])
+            && chunk.is_char_boundary(len)
+        {
+            overlap = len;
+            break;
         }
-    }
-    if emitted.ends_with(chunk) {
-        overlap = chunk.len();
     }
 
     chunk[overlap..].to_string()

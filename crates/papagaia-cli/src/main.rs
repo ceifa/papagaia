@@ -297,15 +297,7 @@ fn run_pick() -> Result<()> {
 }
 
 fn overlay_program() -> PathBuf {
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(parent) = current_exe.parent()
-    {
-        let sibling = parent.join("papagaia-overlay");
-        if sibling.exists() {
-            return sibling;
-        }
-    }
-    PathBuf::from("papagaia-overlay")
+    papagaia_core::overlay_program()
 }
 
 fn run_restart() -> Result<()> {
@@ -1051,16 +1043,16 @@ fn config_backup_path(config_path: &Path) -> Result<PathBuf> {
     Ok(config_path.with_file_name(backup_name))
 }
 
-fn find_whisper_model() -> Option<PathBuf> {
-    let directories = [
-        "~/.local/share/whisper-models/",
-        "~/.local/share/whisper.cpp/",
-        "~/.local/share/whisper.cpp/models/",
-        "~/.cache/whisper.cpp/",
-        "~/.local/share/papagaia/whisper/",
-    ];
+const MODEL_SEARCH_DIRS: &[&str] = &[
+    "~/.local/share/whisper-models/",
+    "~/.local/share/whisper.cpp/",
+    "~/.local/share/whisper.cpp/models/",
+    "~/.cache/whisper.cpp/",
+    "~/.local/share/papagaia/whisper/",
+];
 
-    directories.iter().find_map(|directory| {
+fn find_whisper_model() -> Option<PathBuf> {
+    MODEL_SEARCH_DIRS.iter().find_map(|directory| {
         let directory = PathBuf::from(expand_home(directory));
         find_first_whisper_model_in_dir(&directory)
     })
@@ -1068,19 +1060,17 @@ fn find_whisper_model() -> Option<PathBuf> {
 
 fn gh_copilot_exists() -> bool {
     command_exists("gh")
+        && std::process::Command::new("gh")
+            .args(["copilot", "--version"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
 }
 
 fn find_vad_model() -> Option<PathBuf> {
-    let directories = [
-        "~/.local/share/whisper-models/",
-        "~/.local/share/whisper.cpp/",
-        "~/.local/share/whisper.cpp/models/",
-        "~/.cache/whisper.cpp/",
-        "~/.local/share/papagaia/whisper/",
-    ];
-
     let names = ["silero-vad.onnx", "silero_vad.onnx"];
-    directories.iter().find_map(|directory| {
+    MODEL_SEARCH_DIRS.iter().find_map(|directory| {
         let directory = PathBuf::from(expand_home(directory));
         names.iter().find_map(|name| {
             let path = directory.join(name);
@@ -1171,24 +1161,14 @@ fn print_response(response: ClientResponse) -> Result<()> {
 
 fn send_request(request: &ClientRequest) -> Result<ClientResponse> {
     let socket = socket_path()?;
-    let mut stream = UnixStream::connect(&socket)
+    let stream = UnixStream::connect(&socket)
         .with_context(|| format!("failed to connect to daemon at {}", socket.display()))?;
-    let request = serde_json::to_string(request)?;
-    stream.write_all(request.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-
-    let mut response = String::new();
-    let mut reader = BufReader::new(stream);
-    reader.read_line(&mut response)?;
-    let response: ClientResponse =
-        serde_json::from_str(&response).context("failed to decode daemon response")?;
-    Ok(response)
+    send_on_stream(stream, request)
 }
 
 fn status_request() -> Result<ClientResponse> {
     let socket = socket_path()?;
-    let mut stream = match UnixStream::connect(&socket) {
+    let stream = match UnixStream::connect(&socket) {
         Ok(stream) => stream,
         Err(error)
             if matches!(
@@ -1203,18 +1183,18 @@ fn status_request() -> Result<ClientResponse> {
                 .with_context(|| format!("failed to connect to daemon at {}", socket.display()));
         }
     };
+    send_on_stream(stream, &ClientRequest::Status)
+}
 
-    let request = serde_json::to_string(&ClientRequest::Status)?;
+fn send_on_stream(mut stream: UnixStream, request: &ClientRequest) -> Result<ClientResponse> {
+    let request = serde_json::to_string(request)?;
     stream.write_all(request.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
 
     let mut response = String::new();
-    let mut reader = BufReader::new(stream);
-    reader.read_line(&mut response)?;
-    let response: ClientResponse =
-        serde_json::from_str(&response).context("failed to decode daemon response")?;
-    Ok(response)
+    BufReader::new(stream).read_line(&mut response)?;
+    serde_json::from_str(&response).context("failed to decode daemon response")
 }
 
 #[cfg(test)]
@@ -1275,6 +1255,7 @@ mod tests {
             ydotoold: true,
             whisper_cli: true,
             whisper_model: Some("/tmp/model.bin".into()),
+            vad_model: None,
             engine_choices: vec![test_engine()],
             niri: true,
             hyprland: false,

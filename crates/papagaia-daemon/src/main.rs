@@ -13,6 +13,7 @@ use papagaia_core::{ClientRequest, ClientResponse, Config, runtime_dir, socket_p
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
+    signal,
 };
 
 #[tokio::main]
@@ -39,15 +40,35 @@ async fn main() -> Result<()> {
     }
     let app = Arc::new(App::new(config).await?);
 
+    let mut sigterm =
+        signal::unix::signal(signal::unix::SignalKind::terminate())?;
+
     loop {
-        let (stream, _) = listener.accept().await?;
-        let app = app.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_connection(app, stream).await {
-                eprintln!("papagaia-daemon: {error:#}");
+        tokio::select! {
+            biased;
+            _ = signal::ctrl_c() => {
+                eprintln!("[papagaia] received SIGINT, shutting down");
+                break;
             }
-        });
+            _ = sigterm.recv() => {
+                eprintln!("[papagaia] received SIGTERM, shutting down");
+                break;
+            }
+            result = listener.accept() => {
+                let (stream, _) = result?;
+                let app = app.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = handle_connection(app, stream).await {
+                        eprintln!("papagaia-daemon: {error:#}");
+                    }
+                });
+            }
+        }
     }
+
+    // Clean up the socket file on graceful shutdown.
+    let _ = fs::remove_file(&socket_path);
+    Ok(())
 }
 
 fn prepare_socket_path(socket_path: &Path) -> Result<()> {

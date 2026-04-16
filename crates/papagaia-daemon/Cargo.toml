@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+libc.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 papagaia-core = { path = "../papagaia-core" }
