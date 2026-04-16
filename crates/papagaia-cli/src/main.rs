@@ -891,6 +891,7 @@ fn detect_engine_choices() -> Vec<EngineChoice> {
                 "-m".into(),
                 "gpt-5.4-mini".into(),
                 "--ephemeral".into(),
+                "--skip-git-repo-check".into(),
                 "-c".into(),
                 "model_reasoning_effort=none".into(),
                 "{{prompt}}".into(),
@@ -1126,6 +1127,7 @@ mod tests {
                 "-m".into(),
                 "gpt-5.4-mini".into(),
                 "--ephemeral".into(),
+                "--skip-git-repo-check".into(),
                 "-c".into(),
                 "model_reasoning_effort=none".into(),
                 "{{prompt}}".into(),
@@ -1159,7 +1161,7 @@ mod tests {
         let config = render_init_config(&environment, &options);
         assert!(config.contains("model = \"/tmp/model.bin\""));
         assert!(config.contains(
-            "argv = [\"codex\", \"exec\", \"-m\", \"gpt-5.4-mini\", \"--ephemeral\", \"-c\", \"model_reasoning_effort=none\", \"{{prompt}}\"]"
+            "argv = [\"codex\", \"exec\", \"-m\", \"gpt-5.4-mini\", \"--ephemeral\", \"--skip-git-repo-check\", \"-c\", \"model_reasoning_effort=none\", \"{{prompt}}\"]"
         ));
         assert!(config.contains("[dictation]"));
         assert!(

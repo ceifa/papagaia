@@ -379,6 +379,10 @@ fn default_whisper_argv() -> Vec<String> {
         "auto".into(),
         "-np".into(),
         "-nt".into(),
+        "-bo".into(),
+        "3".into(),
+        "-bs".into(),
+        "3".into(),
         "--prompt".into(),
         "Natural spoken dictation with correct punctuation, natural sentences, and no filler words.".into(),
     ]
