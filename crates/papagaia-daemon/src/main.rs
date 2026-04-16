@@ -40,8 +40,7 @@ async fn main() -> Result<()> {
     }
     let app = Arc::new(App::new(config).await?);
 
-    let mut sigterm =
-        signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
 
     loop {
         tokio::select! {

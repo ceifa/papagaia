@@ -6,3 +6,7 @@ pub use config::{
     config_path, expand_home, overlay_program, runtime_dir, socket_path, validate_prompt_options,
 };
 pub use ipc::{ClientRequest, ClientResponse, OverlayMessage};
+
+pub(crate) fn default_true() -> bool {
+    true
+}

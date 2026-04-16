@@ -13,7 +13,7 @@ use tokio::{
 };
 
 use crate::{
-    cancel::CancelToken, clipboard, dictation::Recorder, dictation::MAX_RECORDING_SECS, llm,
+    cancel::CancelToken, clipboard, dictation::MAX_RECORDING_SECS, dictation::Recorder, llm,
     overlay::OverlayHandle,
 };
 
@@ -139,8 +139,14 @@ impl App {
         let prompt = config.prompt(prompt_name)?.clone();
         let label = format!("running prompt '{prompt_name}'");
         let success_label = prompt_name.to_string();
-        self.run_transform(prompt, label, &success_label, selected_text, preserve_selection)
-            .await
+        self.run_transform(
+            prompt,
+            label,
+            &success_label,
+            selected_text,
+            preserve_selection,
+        )
+        .await
     }
 
     async fn transform_raw(
@@ -160,8 +166,14 @@ impl App {
             stream_output,
         };
         validate_prompt_options(&prompt)?;
-        self.run_transform(prompt, "running ad-hoc prompt".into(), "engine output", selected_text, preserve_selection)
-            .await
+        self.run_transform(
+            prompt,
+            "running ad-hoc prompt".into(),
+            "engine output",
+            selected_text,
+            preserve_selection,
+        )
+        .await
     }
 
     async fn run_transform(
@@ -356,9 +368,7 @@ impl App {
             if !matches!(*state, State::Recording(_)) {
                 bail!("papagaia is not recording");
             }
-            let State::Recording(session) =
-                std::mem::replace(&mut *state, State::Idle)
-            else {
+            let State::Recording(session) = std::mem::replace(&mut *state, State::Idle) else {
                 unreachable!()
             };
             let overlay_epoch = session.overlay_epoch;
@@ -953,18 +963,17 @@ fn compute_stream_delta(emitted: &str, chunk: &str) -> String {
         return rest.to_string();
     }
 
-    // Find the longest suffix of `emitted` that is a prefix of `chunk`.
-    // Walk backwards through chunk's char boundaries to find the first
-    // (longest) match, avoiding the O(n*m) scan of the old approach.
+    // Find the longest suffix of `emitted` that is a prefix of `chunk`. Walk
+    // lengths from longest to shortest so we can stop at the first match.
+    // Reached only when the early-exit cases above don't fire — for typical
+    // cumulative LLM output `strip_prefix` handles it without entering here.
     let emitted_bytes = emitted.as_bytes();
     let chunk_bytes = chunk.as_bytes();
     let max_overlap = emitted_bytes.len().min(chunk_bytes.len());
 
     let mut overlap = 0;
     for len in (1..=max_overlap).rev() {
-        if emitted_bytes.ends_with(&chunk_bytes[..len])
-            && chunk.is_char_boundary(len)
-        {
+        if emitted_bytes.ends_with(&chunk_bytes[..len]) && chunk.is_char_boundary(len) {
             overlap = len;
             break;
         }

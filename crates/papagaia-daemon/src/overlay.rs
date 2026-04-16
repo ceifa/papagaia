@@ -1,11 +1,10 @@
 use std::{
     io::Write,
-    path::PathBuf,
     process::{ChildStdin, Command, Stdio},
 };
 
 use anyhow::Result;
-use papagaia_core::OverlayMessage;
+use papagaia_core::{OverlayMessage, overlay_program};
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
@@ -36,27 +35,27 @@ fn overlay_writer_thread(enabled: bool, mut rx: mpsc::UnboundedReceiver<String>)
     let mut stdin = if enabled { spawn_overlay() } else { None };
 
     while let Some(line) = rx.blocking_recv() {
-        if let Some(writer) = stdin.as_mut() {
-            if writer.write_all(line.as_bytes()).is_ok() && writer.flush().is_ok() {
-                continue;
-            }
+        if let Some(writer) = stdin.as_mut()
+            && writer.write_all(line.as_bytes()).is_ok()
+            && writer.flush().is_ok()
+        {
+            continue;
         }
         if enabled {
             eprintln!("papagaia-daemon: overlay died, respawning");
             stdin = spawn_overlay();
-            if let Some(writer) = stdin.as_mut() {
-                if writer.write_all(line.as_bytes()).is_err() || writer.flush().is_err() {
-                    eprintln!("papagaia-daemon: respawned overlay failed immediately");
-                    stdin = None;
-                }
+            if let Some(writer) = stdin.as_mut()
+                && (writer.write_all(line.as_bytes()).is_err() || writer.flush().is_err())
+            {
+                eprintln!("papagaia-daemon: respawned overlay failed immediately");
+                stdin = None;
             }
         }
     }
 }
 
 fn spawn_overlay() -> Option<ChildStdin> {
-    let overlay_program = overlay_program();
-    match Command::new(&overlay_program)
+    match Command::new(overlay_program())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -68,8 +67,4 @@ fn spawn_overlay() -> Option<ChildStdin> {
             None
         }
     }
-}
-
-fn overlay_program() -> PathBuf {
-    papagaia_core::overlay_program()
 }

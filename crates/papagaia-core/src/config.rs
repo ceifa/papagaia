@@ -138,7 +138,7 @@ pub struct DictationConfig {
     #[serde(default)]
     pub post_process: bool,
     /// Stream post-processed output incrementally as the engine produces it.
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub stream_post_process: bool,
     /// Prompt template for post-processing. Uses `{{text}}` for the transcript
     /// and `{{context}}` for an auto-generated context block.
@@ -177,7 +177,7 @@ pub struct WhisperConfig {
     pub model: String,
     #[serde(default = "default_whisper_argv")]
     pub argv: Vec<String>,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub capture_stdout: bool,
 }
 
@@ -197,7 +197,7 @@ pub struct EngineConfig {
     pub argv: Vec<String>,
     #[serde(default)]
     pub stdin: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub capture_stdout: bool,
 }
 
@@ -207,7 +207,7 @@ pub struct PromptConfig {
     pub template: String,
     #[serde(default)]
     pub strip_markdown_fences: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub trim_whitespace: bool,
     #[serde(default)]
     pub stream_output: bool,
@@ -324,10 +324,6 @@ fn strip_outer_markdown_fence(text: &str) -> String {
     }
 
     text.to_string()
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_overlay_enabled() -> bool {

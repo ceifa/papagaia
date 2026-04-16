@@ -195,24 +195,7 @@ where
     let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
     if let Some(pid) = child.id() {
         tokio::spawn(async move {
-            let status = tokio::task::spawn_blocking(move || {
-                use std::os::unix::process::ExitStatusExt;
-                let mut status: libc::c_int = 0;
-                loop {
-                    let ret = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
-                    if ret == -1 {
-                        let err = std::io::Error::last_os_error();
-                        if err.kind() == std::io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        return Err(err);
-                    }
-                    return Ok(std::process::ExitStatus::from_raw(status));
-                }
-            })
-            .await
-            .unwrap_or_else(|e| Err(std::io::Error::other(e)));
-            let _ = exit_tx.send(status);
+            let _ = exit_tx.send(spawn_waitpid(pid).await);
         });
     }
 
@@ -249,8 +232,13 @@ where
                 // stdout closed but child hasn't exited yet; wait for exit.
                 if exit_status.is_none() {
                     match exit_rx.await {
-                        Ok(Ok(status)) => { exit_status = Some(status); }
-                        Ok(Err(e)) => return Err(e).with_context(|| format!("failed to wait for {}", argv.join(" "))),
+                        Ok(Ok(status)) => {
+                            exit_status = Some(status);
+                        }
+                        Ok(Err(e)) => {
+                            return Err(e)
+                                .with_context(|| format!("failed to wait for {}", argv.join(" ")));
+                        }
                         Err(_) => {}
                     }
                 }
@@ -345,6 +333,29 @@ fn clipboard_probe_token() -> String {
     )
 }
 
+/// Block on `waitpid` for the given PID inside `spawn_blocking`, retrying on
+/// EINTR. Used to await child exit without holding `&mut Child` (so the caller
+/// can still call `start_kill`).
+async fn spawn_waitpid(pid: u32) -> std::io::Result<std::process::ExitStatus> {
+    tokio::task::spawn_blocking(move || {
+        use std::os::unix::process::ExitStatusExt;
+        let mut status: libc::c_int = 0;
+        loop {
+            let ret = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+            if ret == -1 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            return Ok(std::process::ExitStatus::from_raw(status));
+        }
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
 /// Wait for the child to exit, killing it if the cancel token fires.
 ///
 /// Spawns a background task to await the child exit, then `select!`s between
@@ -358,29 +369,11 @@ async fn wait_or_cancel(
     let id = child.id();
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     let wait_argv = argv.join(" ");
-    // Take ownership via a raw waitpid so `child` remains accessible for kill.
+    // Wait via a raw waitpid so `child` remains accessible for kill.
     tokio::spawn(async move {
-        let status = if let Some(pid) = id {
-            // Wait for the specific PID without holding &mut Child.
-            tokio::task::spawn_blocking(move || {
-                use std::os::unix::process::ExitStatusExt;
-                let mut status: libc::c_int = 0;
-                loop {
-                    let ret = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
-                    if ret == -1 {
-                        let err = std::io::Error::last_os_error();
-                        if err.kind() == std::io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        return Err(err);
-                    }
-                    return Ok(std::process::ExitStatus::from_raw(status));
-                }
-            })
-            .await
-            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
-        } else {
-            Err(std::io::Error::other("child has no PID"))
+        let status = match id {
+            Some(pid) => spawn_waitpid(pid).await,
+            None => Err(std::io::Error::other("child has no PID")),
         };
         let _ = tx.send(status);
     });

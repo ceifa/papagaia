@@ -606,6 +606,33 @@ fn send_cancel() {
 // ---------------------------------------------------------------------------
 
 fn install_css() {
+    let display = gtk::gdk::Display::default().expect("display not available");
+
+    // Fallback palette: only applies when the active GTK theme doesn't define
+    // these semantic colors. Theme providers sit at PRIORITY_THEME (200),
+    // which overrides our PRIORITY_FALLBACK (1), so Adwaita & modern themes
+    // win and we only fill in when a minimal theme leaves them undefined.
+    let fallback = gtk::CssProvider::new();
+    fallback.load_from_data(
+        r#"
+        @define-color card_bg_color #1e242f;
+        @define-color card_fg_color #e9edf3;
+        @define-color window_bg_color #1e242f;
+        @define-color window_fg_color #e9edf3;
+        @define-color accent_bg_color #7aa2ff;
+        @define-color accent_color #7aa2ff;
+        @define-color success_color #74d39f;
+        @define-color warning_color #ffb547;
+        @define-color error_color #ff7a85;
+        @define-color borders rgba(128, 128, 128, 0.25);
+        "#,
+    );
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &fallback,
+        gtk::STYLE_PROVIDER_PRIORITY_FALLBACK,
+    );
+
     let provider = gtk::CssProvider::new();
     provider.load_from_data(
         r#"
@@ -617,17 +644,17 @@ fn install_css() {
 
         .papagaia-card {
             padding: 8px 14px;
-            background: linear-gradient(160deg, #171b25 0%, #0f1218 100%);
-            color: #e9edf3;
+            background: linear-gradient(160deg, shade(@card_bg_color, 1.08) 0%, shade(@card_bg_color, 0.88) 100%);
+            color: @card_fg_color;
             border-radius: 12px;
-            border-left: 3px solid #2a313f;
+            border-left: 3px solid @borders;
             min-width: 180px;
         }
 
         .glyph {
             font-size: 12px;
             font-weight: 700;
-            color: #7a8498;
+            color: alpha(@card_fg_color, 0.55);
             min-width: 14px;
         }
 
@@ -635,20 +662,20 @@ fn install_css() {
             font-family: "IBM Plex Sans", "Inter Tight", "Cantarell", sans-serif;
             font-size: 12px;
             font-weight: 400;
-            color: #cfd6e2;
+            color: @card_fg_color;
         }
 
         levelbar.wave trough {
-            background: rgba(255, 255, 255, 0.05);
+            background: alpha(@card_fg_color, 0.08);
             border-radius: 2px;
             min-width: 3px;
         }
 
         levelbar.wave block.filled {
-            background: #ffb547;
+            background: @warning_color;
             border-radius: 2px;
             min-width: 3px;
-            box-shadow: 0 0 8px rgba(255, 181, 71, 0.55);
+            box-shadow: 0 0 8px alpha(@warning_color, 0.55);
         }
 
         levelbar.wave block.empty {
@@ -656,42 +683,42 @@ fn install_css() {
             min-width: 3px;
         }
 
-        .state-busy.papagaia-card { border-left-color: #7aa2ff; }
-        .state-busy .glyph { color: #9fbcff; }
+        .state-busy.papagaia-card { border-left-color: @accent_bg_color; }
+        .state-busy .glyph { color: @accent_bg_color; }
 
-        .state-recording.papagaia-card { border-left-color: #ffb547; }
-        .state-recording .glyph { color: #ffb547; }
+        .state-recording.papagaia-card { border-left-color: @warning_color; }
+        .state-recording .glyph { color: @warning_color; }
 
         .state-success.papagaia-card {
-            border-left-color: #74d39f;
-            border-top-color: rgba(116, 211, 159, 0.22);
-            border-right-color: rgba(116, 211, 159, 0.22);
-            border-bottom-color: rgba(116, 211, 159, 0.22);
+            border-left-color: @success_color;
+            border-top-color: alpha(@success_color, 0.22);
+            border-right-color: alpha(@success_color, 0.22);
+            border-bottom-color: alpha(@success_color, 0.22);
         }
-        .state-success .glyph { color: #74d39f; }
+        .state-success .glyph { color: @success_color; }
 
         .state-error.papagaia-card {
-            border-left-color: #ff7a85;
-            border-top-color: rgba(255, 122, 133, 0.26);
-            border-right-color: rgba(255, 122, 133, 0.26);
-            border-bottom-color: rgba(255, 122, 133, 0.26);
+            border-left-color: @error_color;
+            border-top-color: alpha(@error_color, 0.26);
+            border-right-color: alpha(@error_color, 0.26);
+            border-bottom-color: alpha(@error_color, 0.26);
         }
-        .state-error .glyph { color: #ff7a85; }
+        .state-error .glyph { color: @error_color; }
 
         /* --- Picker --- */
 
         .picker-card {
-            background: linear-gradient(160deg, #171b25 0%, #0f1218 100%);
-            color: #e9edf3;
+            background: linear-gradient(160deg, shade(@card_bg_color, 1.08) 0%, shade(@card_bg_color, 0.88) 100%);
+            color: @card_fg_color;
             border-radius: 14px;
-            border: 1px solid rgba(255, 255, 255, 0.06);
+            border: 1px solid @borders;
             box-shadow: none;
             min-width: 420px;
         }
 
         .picker-input {
-            background: rgba(255, 255, 255, 0.04);
-            color: #e9edf3;
+            background: alpha(@card_fg_color, 0.04);
+            color: @card_fg_color;
             border: none;
             border-radius: 14px 14px 0 0;
             padding: 14px 18px;
@@ -705,11 +732,11 @@ fn install_css() {
         }
 
         .picker-input:focus {
-            box-shadow: inset 0 -2px 0 #7aa2ff;
+            box-shadow: inset 0 -2px 0 @accent_bg_color;
         }
 
         .picker-divider {
-            background: rgba(255, 255, 255, 0.06);
+            background: @borders;
             min-height: 1px;
         }
 
@@ -723,25 +750,25 @@ fn install_css() {
         }
 
         .picker-list row:selected {
-            background: rgba(122, 162, 255, 0.14);
+            background: alpha(@accent_bg_color, 0.14);
         }
 
         .row-name {
             font-family: "IBM Plex Mono", "JetBrains Mono", "Iosevka", "Fira Code", monospace;
             font-size: 13px;
             font-weight: 600;
-            color: #e9edf3;
+            color: @card_fg_color;
         }
 
         .row-summary {
             font-size: 12px;
-            color: #7a8498;
+            color: alpha(@card_fg_color, 0.55);
         }
         "#,
     );
 
     gtk::style_context_add_provider_for_display(
-        &gtk::gdk::Display::default().expect("display not available"),
+        &display,
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );

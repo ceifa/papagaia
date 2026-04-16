@@ -26,8 +26,7 @@ impl Recorder {
 
         let sample_rate = supported_config.sample_rate().0;
         let channels = supported_config.channels();
-        let max_samples =
-            sample_rate as usize * channels as usize * MAX_RECORDING_SECS as usize;
+        let max_samples = sample_rate as usize * channels as usize * MAX_RECORDING_SECS as usize;
         let samples = Arc::new(Mutex::new(Vec::new()));
         let samples_for_callback = samples.clone();
         let level_tx_f32 = level_tx.clone();

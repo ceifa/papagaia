@@ -1,6 +1,7 @@
 mod systemd;
 
 use std::{
+    ffi::OsStr,
     fs,
     io::ErrorKind,
     io::{self, BufRead, BufReader, IsTerminal, Read, Write},
@@ -11,8 +12,15 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgAction, Args, Parser, Subcommand};
-use papagaia_core::{ClientRequest, ClientResponse, Config, expand_home, socket_path};
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{
+    CompleteEnv,
+    engine::{ArgValueCompleter, CompletionCandidate},
+    env::{Bash, EnvCompleter, Fish, Zsh},
+};
+use papagaia_core::{
+    ClientRequest, ClientResponse, Config, expand_home, overlay_program, socket_path,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -45,13 +53,26 @@ enum Commands {
     },
     Restart,
     ConfigPath,
+    Completions {
+        shell: CompletionShell,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
 }
 
 #[derive(Debug, Subcommand)]
 #[command(disable_help_subcommand = true)]
 enum PromptCommands {
     List,
-    Run { name: String },
+    Run {
+        #[arg(add = ArgValueCompleter::new(complete_prompt_names))]
+        name: String,
+    },
     Raw(RawPromptArgs),
     Pick,
 }
@@ -119,6 +140,8 @@ struct DoctorCheck {
 }
 
 fn main() -> Result<()> {
+    CompleteEnv::with_factory(Cli::command).complete();
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -157,7 +180,40 @@ fn main() -> Result<()> {
             DictateCommands::Toggle => print_response(send_request(&ClientRequest::DictateToggle)?),
         },
         Commands::Restart => run_restart(),
+        Commands::Completions { shell } => write_completions(shell),
     }
+}
+
+fn write_completions(shell: CompletionShell) -> Result<()> {
+    let mut buf = Vec::new();
+    render_completion_script(shell, &mut buf)?;
+    io::stdout().write_all(&buf)?;
+    Ok(())
+}
+
+fn render_completion_script(shell: CompletionShell, buf: &mut Vec<u8>) -> Result<()> {
+    let completer: &dyn EnvCompleter = match shell {
+        CompletionShell::Bash => &Bash,
+        CompletionShell::Zsh => &Zsh,
+        CompletionShell::Fish => &Fish,
+    };
+    completer
+        .write_registration("COMPLETE", "papagaia", "papagaia", "papagaia", buf)
+        .context("failed to generate completion registration script")?;
+    Ok(())
+}
+
+fn complete_prompt_names(current: &OsStr) -> Vec<CompletionCandidate> {
+    let prefix = current.to_string_lossy();
+    let Ok(config) = Config::load() else {
+        return Vec::new();
+    };
+    config
+        .prompts
+        .into_iter()
+        .filter(|p| p.name.starts_with(prefix.as_ref()))
+        .map(|p| CompletionCandidate::new(p.name))
+        .collect()
 }
 
 fn print_prompt_templates() -> Result<()> {
@@ -296,10 +352,6 @@ fn run_pick() -> Result<()> {
     }
 }
 
-fn overlay_program() -> PathBuf {
-    papagaia_core::overlay_program()
-}
-
 fn run_restart() -> Result<()> {
     systemd::restart()?;
     println!("daemon restarted");
@@ -398,7 +450,94 @@ fn run_init(force: bool, no_backup: bool) -> Result<()> {
         }
     }
 
+    if let Err(error) = install_shell_completion() {
+        println!("Skipped shell completion install: {error:#}");
+    }
+
     println!("\nRun `papagaia doctor` next to verify commands and paths.");
+    Ok(())
+}
+
+fn install_shell_completion() -> Result<()> {
+    let Some(shell_path) = std::env::var_os("SHELL") else {
+        println!("Skipped shell completions: $SHELL is not set.");
+        return Ok(());
+    };
+    let shell_name = Path::new(&shell_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+
+    match shell_name {
+        "fish" => install_fish_completion(),
+        "bash" => append_rc_source(CompletionShell::Bash, "bash", "~/.bashrc"),
+        "zsh" => append_rc_source(CompletionShell::Zsh, "zsh", "~/.zshrc"),
+        "" => {
+            println!("Skipped shell completions: could not determine shell from $SHELL.");
+            Ok(())
+        }
+        other => {
+            println!(
+                "Skipped shell completions: `{other}` not supported. Install manually with `papagaia completions <bash|zsh|fish>`."
+            );
+            Ok(())
+        }
+    }
+}
+
+fn install_fish_completion() -> Result<()> {
+    let path = PathBuf::from(expand_home("~/.config/fish/completions/papagaia.fish"));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let mut buf = Vec::new();
+    render_completion_script(CompletionShell::Fish, &mut buf)?;
+    fs::write(&path, &buf).with_context(|| format!("failed to write {}", path.display()))?;
+    println!("Wrote fish completions to {}", path.display());
+    Ok(())
+}
+
+fn append_rc_source(shell: CompletionShell, shell_name: &str, rc_rel: &str) -> Result<()> {
+    let rc = PathBuf::from(expand_home(rc_rel));
+    let marker = "# papagaia completions (managed by `papagaia init`)";
+    let source_line = format!("source <(papagaia completions {shell_name})");
+
+    let existing = fs::read_to_string(&rc).unwrap_or_default();
+    if existing.contains(marker) || existing.contains(&source_line) {
+        println!("Shell completions already present in {}", rc.display());
+        return Ok(());
+    }
+
+    // Verify papagaia can emit the script before touching the rc file.
+    let mut probe = Vec::new();
+    render_completion_script(shell, &mut probe)?;
+
+    if let Some(parent) = rc.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let leading = if existing.is_empty() || existing.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    let block = format!("{leading}\n{marker}\n{source_line}\n");
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&rc)
+        .with_context(|| format!("failed to open {}", rc.display()))?;
+    file.write_all(block.as_bytes())
+        .with_context(|| format!("failed to append to {}", rc.display()))?;
+
+    println!("Appended shell completions to {}", rc.display());
+    println!(
+        "Restart your shell or run `source {}` to activate.",
+        rc.display()
+    );
     Ok(())
 }
 
@@ -811,7 +950,11 @@ fn render_init_config(environment: &DetectedEnvironment, options: &InitOptions) 
     } else {
         "[]".into()
     };
-    let post_process = if options.post_process { "true" } else { "false" };
+    let post_process = if options.post_process {
+        "true"
+    } else {
+        "false"
+    };
     let vad_args = environment
         .vad_model
         .as_ref()
@@ -971,7 +1114,8 @@ fn detect_engine_choices() -> Vec<EngineChoice> {
                 "--tools".into(),
                 "".into(),
                 "--system-prompt".into(),
-                "You transform text. Output only the transformed text, no preamble or explanation.".into(),
+                "You transform text. Output only the transformed text, no preamble or explanation."
+                    .into(),
                 "--no-session-persistence".into(),
                 "--exclude-dynamic-system-prompt-sections".into(),
                 "--setting-sources".into(),
@@ -1069,7 +1213,7 @@ fn gh_copilot_exists() -> bool {
 }
 
 fn find_vad_model() -> Option<PathBuf> {
-    let names = ["silero-vad.onnx", "silero_vad.onnx"];
+    let names = ["silero-vad.bin", "silero-vad.onnx"];
     MODEL_SEARCH_DIRS.iter().find_map(|directory| {
         let directory = PathBuf::from(expand_home(directory));
         names.iter().find_map(|name| {
