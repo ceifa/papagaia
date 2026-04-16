@@ -100,6 +100,52 @@ pub async fn run_command(
     })
 }
 
+/// Like [`run_command`] but tolerates specific non-zero exit codes, returning
+/// the output as-is instead of bailing. Other non-zero codes still fail.
+pub async fn run_command_allow_exit(
+    argv: &[String],
+    cancel: &CancelToken,
+    allowed_codes: &[i32],
+) -> Result<std::process::Output> {
+    if cancel.is_cancelled() {
+        bail!("operation cancelled");
+    }
+
+    let Some(program) = argv.first() else {
+        bail!("cannot run an empty command");
+    };
+
+    let mut command = Command::new(program);
+    command.args(&argv[1..]);
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    command.kill_on_drop(true);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", argv.join(" ")))?;
+
+    let mut child_stdout = child.stdout.take();
+    let mut child_stderr = child.stderr.take();
+
+    let status = wait_or_cancel(&mut child, cancel, argv).await?;
+
+    let stdout = drain_pipe(&mut child_stdout).await;
+    let stderr = drain_pipe(&mut child_stderr).await;
+
+    let code = status.code().unwrap_or(-1);
+    if !status.success() && !allowed_codes.contains(&code) {
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        bail!("{}", command_failure(argv, stderr_text.trim()));
+    }
+
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 pub async fn run_command_streaming<F, Fut>(
     argv: &[String],
     stdin_text: Option<&str>,

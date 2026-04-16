@@ -7,7 +7,7 @@ use papagaia_core::{EngineConfig, WhisperConfig};
 
 use crate::{
     cancel::CancelToken,
-    clipboard::{run_command, run_command_streaming},
+    clipboard::{run_command, run_command_allow_exit, run_command_streaming},
 };
 
 pub async fn run_engine(
@@ -65,6 +65,9 @@ where
     Ok(clean_engine_output(&text))
 }
 
+/// Exit code whisper-cli returns when VAD detects no speech in the audio.
+const WHISPER_EXIT_NO_SPEECH: i32 = 10;
+
 pub async fn run_whisper(
     whisper: &WhisperConfig,
     audio_path: &Path,
@@ -77,7 +80,7 @@ pub async fn run_whisper(
         &whisper.argv,
         &[("model", &whisper.model), ("audio_path", audio_path)],
     );
-    let output = run_command(&argv, None, cancel).await?;
+    let output = run_command_allow_exit(&argv, cancel, &[WHISPER_EXIT_NO_SPEECH]).await?;
     if !whisper.capture_stdout {
         return Ok(String::new());
     }

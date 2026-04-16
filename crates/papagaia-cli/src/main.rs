@@ -87,6 +87,7 @@ struct DetectedEnvironment {
     ydotoold: bool,
     whisper_cli: bool,
     whisper_model: Option<PathBuf>,
+    vad_model: Option<PathBuf>,
     engine_choices: Vec<EngineChoice>,
     niri: bool,
     hyprland: bool,
@@ -623,6 +624,15 @@ fn run_doctor() -> Result<()> {
         ),
     });
 
+    checks.push(DoctorCheck {
+        level: CheckLevel::Optional,
+        ok: environment.vad_model.is_some(),
+        label: "VAD model (silero-vad.onnx)".into(),
+        suggestion: Some(
+            "download silero-vad.onnx to ~/.local/share/whisper-models/ for voice activity detection (reduces hallucinations on silent audio)".into(),
+        ),
+    });
+
     let required_total = checks
         .iter()
         .filter(|check| matches!(check.level, CheckLevel::Required))
@@ -686,6 +696,14 @@ fn run_doctor() -> Result<()> {
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| config.whisper.model.clone())
+    );
+    println!(
+        "- vad model: {}",
+        environment
+            .vad_model
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "not found".into())
     );
     println!(
         "- detected engines: {}",
@@ -768,6 +786,7 @@ fn detect_environment() -> DetectedEnvironment {
         ydotoold: command_exists("ydotoold"),
         whisper_cli: command_exists("whisper-cli"),
         whisper_model: find_whisper_model(),
+        vad_model: find_vad_model(),
         engine_choices: detect_engine_choices(),
         niri: command_exists("niri"),
         hyprland: command_exists("hyprctl"),
@@ -801,6 +820,11 @@ fn render_init_config(environment: &DetectedEnvironment, options: &InitOptions) 
         "[]".into()
     };
     let post_process = if options.post_process { "true" } else { "false" };
+    let vad_args = environment
+        .vad_model
+        .as_ref()
+        .map(|path| format!(r#", "--vad", "-vm", "{}""#, path.display()))
+        .unwrap_or_default();
 
     format!(
         r#"logging = false
@@ -818,7 +842,7 @@ enabled = true
 
 [whisper]
 model = "{whisper_model}"
-argv = ["whisper-cli", "-m", "{{{{model}}}}", "-f", "{{{{audio_path}}}}", "-np", "-nt", "-l", "auto", "--prompt", "Natural spoken dictation with correct punctuation, natural sentences, and no filler words."]
+argv = ["whisper-cli", "-m", "{{{{model}}}}", "-f", "{{{{audio_path}}}}", "-np", "-nt", "-l", "auto"{vad_args}, "--prompt", "Natural spoken dictation with correct punctuation, natural sentences, and no filler words."]
 capture_stdout = true
 
 [dictation]
@@ -1044,6 +1068,25 @@ fn find_whisper_model() -> Option<PathBuf> {
 
 fn gh_copilot_exists() -> bool {
     command_exists("gh")
+}
+
+fn find_vad_model() -> Option<PathBuf> {
+    let directories = [
+        "~/.local/share/whisper-models/",
+        "~/.local/share/whisper.cpp/",
+        "~/.local/share/whisper.cpp/models/",
+        "~/.cache/whisper.cpp/",
+        "~/.local/share/papagaia/whisper/",
+    ];
+
+    let names = ["silero-vad.onnx", "silero_vad.onnx"];
+    directories.iter().find_map(|directory| {
+        let directory = PathBuf::from(expand_home(directory));
+        names.iter().find_map(|name| {
+            let path = directory.join(name);
+            path.is_file().then_some(path)
+        })
+    })
 }
 
 fn find_first_whisper_model_in_dir(directory: &Path) -> Option<PathBuf> {
