@@ -408,25 +408,15 @@ async fn drain_pipe<R: AsyncRead + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
         return Vec::new();
     };
     let mut buf = Vec::new();
-    // Try a non-blocking read first — for well-behaved commands the pipe
-    // closes with the child and this completes instantly. Only fall back to
-    // the 100ms timeout when the pipe is still open (e.g. wl-copy forks a
-    // background process that inherits the pipe).
-    let mut tmp = [0u8; 4096];
-    match pipe.read(&mut tmp).await {
-        Ok(0) => return buf,
-        Ok(n) => buf.extend_from_slice(&tmp[..n]),
-        Err(_) => return buf,
-    }
-    match tokio::time::timeout(
+    // Cap the whole drain — not just subsequent reads. wl-copy's forked
+    // background daemon inherits stderr and never writes or closes it, so
+    // the first read blocks forever without a timeout around it.
+    let _ = tokio::time::timeout(
         Duration::from_millis(100),
         tokio::io::AsyncReadExt::read_to_end(pipe, &mut buf),
     )
-    .await
-    {
-        Ok(Ok(_)) | Ok(Err(_)) => buf,
-        Err(_) => buf,
-    }
+    .await;
+    buf
 }
 
 /// Read the next chunk of stdout bytes. Returns `Ok(None)` when the pipe

@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{
     CompleteEnv,
     engine::{ArgValueCompleter, CompletionCandidate},
@@ -93,10 +93,6 @@ struct RawPromptArgs {
     stdin: bool,
     #[arg(long)]
     stream_output: bool,
-    #[arg(long, default_value_t = true, action = ArgAction::Set)]
-    strip_markdown_fences: bool,
-    #[arg(long = "trim-whitespace", default_value_t = true, action = ArgAction::Set)]
-    trim_whitespace: bool,
 }
 
 #[derive(Debug)]
@@ -123,7 +119,18 @@ struct EngineChoice {
 struct InitOptions {
     chosen_engine: Option<EngineChoice>,
     post_process: bool,
+    language: String,
 }
+
+const WHISPER_LANGUAGES: &[&str] = &[
+    "auto", "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar",
+    "sv", "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu", "ta", "no",
+    "th", "ur", "hr", "bg", "lt", "la", "mi", "ml", "cy", "sk", "te", "fa", "lv", "bn", "sr", "az",
+    "sl", "kn", "et", "mk", "br", "eu", "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw", "gl", "mr",
+    "pa", "si", "km", "sn", "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu", "am", "yi", "lo",
+    "uz", "fo", "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl", "mg", "as", "tt",
+    "haw", "ln", "ha", "ba", "jw", "su", "yue",
+];
 
 #[derive(Debug, Clone, Copy)]
 enum CheckLevel {
@@ -164,8 +171,6 @@ fn main() -> Result<()> {
                     template,
                     selected_text: None,
                     preserve_selection: false,
-                    strip_markdown_fences: args.strip_markdown_fences,
-                    trim_whitespace: args.trim_whitespace,
                     stream_output: args.stream_output,
                 })?)
             }
@@ -243,9 +248,7 @@ fn print_prompt_templates() -> Result<()> {
     println!();
     println!("Run one with:   papagaia prompt run <name>");
     println!("Ad-hoc prompt:  papagaia prompt raw --text 'Rewrite this: {{{{text}}}}'");
-    println!(
-        "Streaming raw:  papagaia prompt raw --text 'Fix this: {{{{text}}}}' --stream-output --strip-markdown-fences false"
-    );
+    println!("Streaming raw:  papagaia prompt raw --text 'Fix this: {{{{text}}}}' --stream-output");
     println!("Picker raw:     typing ad-hoc text in the picker streams by default");
     Ok(())
 }
@@ -327,14 +330,6 @@ fn run_pick() -> Result<()> {
                 .and_then(|t| t.as_str())
                 .context("picker result missing 'template'")?
                 .to_string();
-            let strip_markdown_fences = result
-                .get("strip-markdown-fences")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let trim_whitespace = result
-                .get("trim-whitespace")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
             let stream_output = result
                 .get("stream-output")
                 .and_then(|v| v.as_bool())
@@ -343,8 +338,6 @@ fn run_pick() -> Result<()> {
                 template,
                 selected_text: None,
                 preserve_selection: false,
-                strip_markdown_fences,
-                trim_whitespace,
                 stream_output,
             })?)
         }
@@ -392,9 +385,16 @@ fn run_init(force: bool, no_backup: bool) -> Result<()> {
         false
     };
 
+    let language = if interactive {
+        ask_whisper_language()?
+    } else {
+        "auto".to_string()
+    };
+
     let options = InitOptions {
         chosen_engine,
         post_process,
+        language,
     };
 
     let config_text = render_init_config(&environment, &options);
@@ -623,6 +623,29 @@ fn choose_engine_interactive(choices: &[EngineChoice]) -> Result<Option<EngineCh
         }
 
         println!("Please enter a number between 0 and {}.", choices.len());
+    }
+}
+
+fn ask_whisper_language() -> Result<String> {
+    loop {
+        print!("Dictation language? Enter a whisper code (e.g. en, pt, es) or 'auto' [auto]: ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_lowercase();
+
+        if input.is_empty() {
+            return Ok("auto".to_string());
+        }
+
+        if WHISPER_LANGUAGES.contains(&input.as_str()) {
+            return Ok(input);
+        }
+
+        println!(
+            "Unknown language `{input}`. See https://github.com/ggerganov/whisper.cpp for supported codes, or use 'auto'."
+        );
     }
 }
 
@@ -960,9 +983,10 @@ fn render_init_config(environment: &DetectedEnvironment, options: &InitOptions) 
         .as_ref()
         .map(|path| format!(r#", "--vad", "-vm", "{}""#, path.display()))
         .unwrap_or_default();
+    let language = options.language.as_str();
 
     format!(
-        r#"logging = false
+        r#"logging = true
 
 [tools]
 read_clipboard_command = ["wl-paste", "--no-newline"]
@@ -977,7 +1001,7 @@ enabled = true
 
 [whisper]
 model = "{whisper_model}"
-argv = ["whisper-cli", "-m", "{{{{model}}}}", "-f", "{{{{audio_path}}}}", "-np", "-nt", "-l", "auto"{vad_args}, "--prompt", "Natural spoken dictation with correct punctuation, natural sentences, and no filler words."]
+argv = ["whisper-cli", "-m", "{{{{model}}}}", "-f", "{{{{audio_path}}}}", "-np", "-nt", "-l", "{language}"{vad_args}, "--prompt", "Natural spoken dictation with correct punctuation, natural sentences, and no filler words."]
 capture_stdout = true
 
 [dictation]
@@ -1020,10 +1044,7 @@ Return only the rewritten text.
 
 {{{{text}}}}
 """
-strip_markdown_fences = true
-trim_whitespace = true
 # Optional: set stream_output = true to type text as the engine prints it.
-# Streaming prompts must keep strip_markdown_fences = false.
 
 [[prompts]]
 name = "fix-grammar"
@@ -1033,8 +1054,6 @@ Return only the corrected text.
 
 {{{{text}}}}
 """
-strip_markdown_fences = true
-trim_whitespace = true
 "#
     )
 }
@@ -1412,6 +1431,7 @@ mod tests {
         let options = InitOptions {
             chosen_engine: Some(test_engine()),
             post_process: true,
+            language: "auto".into(),
         };
 
         let config = render_init_config(&environment, &options);
@@ -1433,6 +1453,7 @@ mod tests {
         let enabled = InitOptions {
             chosen_engine: Some(test_engine()),
             post_process: true,
+            language: "auto".into(),
         };
         let config = render_init_config(&environment, &enabled);
         assert!(config.contains("post_process = true"));
@@ -1440,6 +1461,7 @@ mod tests {
         let disabled = InitOptions {
             chosen_engine: Some(test_engine()),
             post_process: false,
+            language: "auto".into(),
         };
         let config = render_init_config(&environment, &disabled);
         assert!(config.contains("post_process = false"));
@@ -1451,6 +1473,7 @@ mod tests {
         let options = InitOptions {
             chosen_engine: Some(test_engine()),
             post_process: false,
+            language: "auto".into(),
         };
         let config = render_init_config(&environment, &options);
         assert!(config.contains("context_awareness = true"));
@@ -1462,6 +1485,7 @@ mod tests {
         let options = InitOptions {
             chosen_engine: None,
             post_process: false,
+            language: "auto".into(),
         };
         let config = render_init_config(&environment, &options);
         assert!(config.contains("\"your-llm-cli\""));

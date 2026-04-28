@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.2.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libgtk4-layer-shell-dev libasound2-dev
+
+      - name: Bump version
+        run: |
+          sed -i 's/^version = ".*"/version = "${{ inputs.version }}"/' Cargo.toml
+          cargo generate-lockfile
+
+      - name: Commit, tag, and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Release v${{ inputs.version }}"
+          git tag "v${{ inputs.version }}"
+          git push origin main "v${{ inputs.version }}"
+          gh release create "v${{ inputs.version }}" --generate-notes
+
+      - name: Setup SSH for AUR
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          echo -e "Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur\n  User aur" >> ~/.ssh/config
+
+      - name: Update AUR package
+        run: |
+          TARBALL_URL="https://github.com/${{ github.repository }}/archive/refs/tags/v${{ inputs.version }}.tar.gz"
+
+          # Wait for the tarball to become available
+          for i in $(seq 1 10); do
+            HTTP_CODE=$(curl -sL -o /dev/null -w "%{http_code}" "$TARBALL_URL")
+            [ "$HTTP_CODE" = "200" ] && break
+            sleep 5
+          done
+
+          SHA256=$(curl -sL "$TARBALL_URL" | sha256sum | awk '{print $1}')
+
+          git clone ssh://aur@aur.archlinux.org/papagaia.git aur-pkg
+          cd aur-pkg
+
+          sed -i "s/^pkgver=.*/pkgver=${{ inputs.version }}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s|sha256sums=('[^']*'|sha256sums=('${SHA256}'|" PKGBUILD
+
+          # Generate .SRCINFO in Arch container (makepkg refuses to run as root)
+          docker run --rm -v "$(pwd):/pkg" archlinux:base-devel bash -c "
+            useradd -m builder && chown -R builder:builder /pkg &&
+            su builder -c 'cd /pkg && makepkg --printsrcinfo > .SRCINFO'
+          "
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${{ inputs.version }}"
+          git push

@@ -4,9 +4,7 @@ use std::sync::{
 };
 
 use anyhow::{Result, bail};
-use papagaia_core::{
-    ClientRequest, ClientResponse, Config, OverlayMessage, PromptConfig, validate_prompt_options,
-};
+use papagaia_core::{ClientRequest, ClientResponse, Config, OverlayMessage, PromptConfig};
 use tokio::{
     sync::{Mutex, mpsc},
     time::{Duration, sleep},
@@ -108,19 +106,10 @@ impl App {
                 template,
                 selected_text,
                 preserve_selection,
-                strip_markdown_fences,
-                trim_whitespace,
                 stream_output,
             } => {
-                self.transform_raw(
-                    &template,
-                    selected_text,
-                    preserve_selection,
-                    strip_markdown_fences,
-                    trim_whitespace,
-                    stream_output,
-                )
-                .await
+                self.transform_raw(&template, selected_text, preserve_selection, stream_output)
+                    .await
             }
             ClientRequest::DictateStart => self.dictate_start().await,
             ClientRequest::DictateStop => self.dictate_stop().await,
@@ -154,18 +143,13 @@ impl App {
         template: &str,
         selected_text: Option<String>,
         preserve_selection: bool,
-        strip_markdown_fences: bool,
-        trim_whitespace: bool,
         stream_output: bool,
     ) -> Result<ClientResponse> {
         let prompt = PromptConfig {
             name: "ad-hoc".into(),
             template: template.into(),
-            strip_markdown_fences,
-            trim_whitespace,
             stream_output,
         };
-        validate_prompt_options(&prompt)?;
         self.run_transform(
             prompt,
             "running ad-hoc prompt".into(),
@@ -261,23 +245,13 @@ impl App {
         };
         log!(
             config,
-            "[transform] stream={} strip_fences={} trim_ws={} selected={}",
+            "[transform] stream={} selected={}",
             prompt.stream_output,
-            prompt.strip_markdown_fences,
-            prompt.trim_whitespace,
             selected.is_some()
         );
         log!(config, "[transform] rendered prompt: {rendered_prompt}");
         let cleaned = if prompt.stream_output {
-            stream_prompt_output(
-                &self.overlay,
-                &config.tools,
-                prompt,
-                &engine,
-                &rendered_prompt,
-                cancel,
-            )
-            .await?
+            stream_prompt_output(&config.tools, &engine, &rendered_prompt, cancel).await?
         } else {
             let raw = llm::run_engine(&engine, &rendered_prompt, cancel).await?;
             log!(config, "[transform] engine output: {raw}");
@@ -413,28 +387,15 @@ impl App {
                 );
 
                 if config.dictation.stream_post_process {
-                    let prompt_cfg = PromptConfig {
-                        name: "dictation-post-process".into(),
-                        template: String::new(),
-                        strip_markdown_fences: false,
-                        trim_whitespace: true,
-                        stream_output: true,
-                    };
                     overlay
                         .send(OverlayMessage::Busy {
                             label: "Processing".into(),
                             grab_keyboard: false,
                         })
                         .await;
-                    let processed = stream_prompt_output(
-                        &overlay,
-                        &config.tools,
-                        &prompt_cfg,
-                        config.engine(),
-                        &rendered,
-                        &cancel,
-                    )
-                    .await?;
+                    let processed =
+                        stream_prompt_output(&config.tools, config.engine(), &rendered, &cancel)
+                            .await?;
                     log!(config, "[dictate] post-processed (streamed): {processed}");
                     if processed.is_empty() {
                         overlay
@@ -725,32 +686,22 @@ fn extract_window_title(output: &str) -> String {
 }
 
 async fn stream_prompt_output(
-    overlay: &OverlayHandle,
     tools: &papagaia_core::ToolConfig,
-    prompt: &PromptConfig,
     engine: &papagaia_core::EngineConfig,
     rendered_prompt: &str,
     cancel: &CancelToken,
 ) -> Result<String> {
-    let state = Arc::new(StdMutex::new(StreamOutputState::new(
-        prompt.trim_whitespace,
-    )));
-    let overlay_for_tail = overlay.clone();
-    let overlay_for_chunks = overlay.clone();
+    let state = Arc::new(StdMutex::new(StreamOutputState::new()));
     let tools_for_tail = tools.clone();
     let cancel_for_tail = cancel.clone();
     let callback_tools = tools.clone();
     let callback_cancel = cancel.clone();
     let callback_state = state.clone();
-    let stream_started = Arc::new(StdMutex::new(false));
-    let callback_started = stream_started.clone();
 
     llm::run_engine_streaming(engine, rendered_prompt, &cancel_for_tail, move |chunk| {
-        let overlay = overlay_for_chunks.clone();
         let tools = callback_tools.clone();
         let cancel = callback_cancel.clone();
         let callback_state = callback_state.clone();
-        let callback_started = callback_started.clone();
         async move {
             let flushed = {
                 let mut state = callback_state
@@ -759,25 +710,15 @@ async fn stream_prompt_output(
                 state.push(&chunk)
             };
             if !flushed.is_empty() {
-                let first_flush = {
-                    let mut started = callback_started
-                        .lock()
-                        .expect("stream started lock poisoned");
-                    if *started {
-                        false
-                    } else {
-                        *started = true;
-                        true
-                    }
-                };
-                if first_flush {
-                    overlay.send(OverlayMessage::Hidden).await;
-                    sleep(Duration::from_millis(80)).await;
-                }
                 // Clipboard paste (not direct wtype) — wtype relies on
                 // virtual-keyboard keysyms which don't cover codepoints above
                 // the BMP, so emojis and other astral-plane chars get dropped
                 // or substituted. Clipboard paste round-trips raw UTF-8.
+                //
+                // The overlay intentionally stays visible ("Processing…")
+                // during streaming paste. Unmapping the layer surface between
+                // chunks disturbs the target window's keyboard focus on niri
+                // and swallows the Ctrl+V.
                 clipboard::paste_text(&tools, &flushed, &cancel).await?;
                 sleep(Duration::from_millis(28)).await;
             }
@@ -794,19 +735,6 @@ async fn stream_prompt_output(
     };
 
     if !tail.is_empty() {
-        let first_flush = {
-            let mut started = stream_started.lock().expect("stream started lock poisoned");
-            if *started {
-                false
-            } else {
-                *started = true;
-                true
-            }
-        };
-        if first_flush {
-            overlay_for_tail.send(OverlayMessage::Hidden).await;
-            sleep(Duration::from_millis(80)).await;
-        }
         clipboard::paste_text(&tools_for_tail, &tail, &cancel_for_tail).await?;
     }
 
@@ -814,7 +742,6 @@ async fn stream_prompt_output(
 }
 
 struct StreamOutputState {
-    trim_whitespace: bool,
     saw_non_whitespace: bool,
     pending_whitespace: String,
     escape_state: EscapeState,
@@ -824,9 +751,8 @@ struct StreamOutputState {
 }
 
 impl StreamOutputState {
-    fn new(trim_whitespace: bool) -> Self {
+    fn new() -> Self {
         Self {
-            trim_whitespace,
             saw_non_whitespace: false,
             pending_whitespace: String::new(),
             escape_state: EscapeState::None,
@@ -844,11 +770,7 @@ impl StreamOutputState {
         }
         self.observed_sanitized.push_str(&raw_delta);
 
-        let cleaned = if self.trim_whitespace {
-            self.trimmed_chunk(&raw_delta)
-        } else {
-            raw_delta
-        };
+        let cleaned = self.trimmed_chunk(&raw_delta);
         if cleaned.is_empty() {
             return String::new();
         }
@@ -1020,9 +942,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use papagaia_core::{EngineConfig, PromptConfig, ToolConfig};
+    use papagaia_core::{EngineConfig, ToolConfig};
 
-    use crate::{cancel::CancelToken, overlay::OverlayHandle};
+    use crate::cancel::CancelToken;
 
     use super::{
         DictationContext, StreamOutputState, compute_stream_delta, extract_window_title,
@@ -1031,22 +953,12 @@ mod tests {
 
     #[test]
     fn streaming_trim_drops_outer_whitespace() {
-        let mut state = StreamOutputState::new(true);
+        let mut state = StreamOutputState::new();
 
         assert_eq!(state.push("  hello"), "");
         assert_eq!(state.push(" world  "), "");
         assert_eq!(state.finish(), "hello world");
         assert_eq!(state.emitted, "hello world");
-    }
-
-    #[test]
-    fn streaming_without_trim_preserves_whitespace() {
-        let mut state = StreamOutputState::new(false);
-
-        assert_eq!(state.push(" hi"), "");
-        assert_eq!(state.push(" there "), "");
-        assert_eq!(state.finish(), " hi there ");
-        assert_eq!(state.emitted, " hi there ");
     }
 
     #[test]
@@ -1063,7 +975,7 @@ mod tests {
 
     #[test]
     fn streaming_state_strips_ansi_sequences() {
-        let mut state = StreamOutputState::new(false);
+        let mut state = StreamOutputState::new();
         assert_eq!(state.push("\u{1b}[2Khello"), "");
         assert_eq!(state.finish(), "hello");
     }
@@ -1097,30 +1009,15 @@ printf 'own fox'
         );
 
         let tools = fake_tools(&clipboard_script, &out_path);
-        let prompt = PromptConfig {
-            name: "test".into(),
-            template: "{{text}}".into(),
-            strip_markdown_fences: false,
-            trim_whitespace: true,
-            stream_output: true,
-        };
         let engine = EngineConfig {
             argv: vec![engine_script.display().to_string()],
             stdin: false,
             capture_stdout: true,
         };
 
-        let overlay = OverlayHandle::spawn(false).expect("overlay should be disabled in tests");
-        let emitted = stream_prompt_output(
-            &overlay,
-            &tools,
-            &prompt,
-            &engine,
-            "ignored",
-            &CancelToken::new(),
-        )
-        .await
-        .expect("streaming should succeed");
+        let emitted = stream_prompt_output(&tools, &engine, "ignored", &CancelToken::new())
+            .await
+            .expect("streaming should succeed");
         let typed = fs::read_to_string(&out_path).expect("typed output should exist");
 
         assert_eq!(emitted, "The quick brown fox");
@@ -1157,30 +1054,15 @@ printf 'world!\b!'
         );
 
         let tools = fake_tools(&clipboard_script, &out_path);
-        let prompt = PromptConfig {
-            name: "test".into(),
-            template: "{{text}}".into(),
-            strip_markdown_fences: false,
-            trim_whitespace: false,
-            stream_output: true,
-        };
         let engine = EngineConfig {
             argv: vec![engine_script.display().to_string()],
             stdin: false,
             capture_stdout: true,
         };
 
-        let overlay = OverlayHandle::spawn(false).expect("overlay should be disabled in tests");
-        let emitted = stream_prompt_output(
-            &overlay,
-            &tools,
-            &prompt,
-            &engine,
-            "ignored",
-            &CancelToken::new(),
-        )
-        .await
-        .expect("streaming should succeed");
+        let emitted = stream_prompt_output(&tools, &engine, "ignored", &CancelToken::new())
+            .await
+            .expect("streaming should succeed");
         let typed = fs::read_to_string(&out_path).expect("typed output should exist");
 
         assert_eq!(emitted, "hello world!");

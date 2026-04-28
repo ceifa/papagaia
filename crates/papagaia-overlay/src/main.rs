@@ -36,8 +36,6 @@ enum PickerResult {
     },
     Raw {
         template: String,
-        strip_markdown_fences: bool,
-        trim_whitespace: bool,
         stream_output: bool,
     },
 }
@@ -55,6 +53,12 @@ const STATE_CLASSES: &[&str] = &[
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // NON_UNIQUE on both: without it, GTK registers the application_id as a
+    // D-Bus name. A second instance (e.g. after the daemon restarts while an
+    // orphan overlay is still alive) would then silently act as a remote
+    // client — it activates the orphan and exits without creating its own
+    // window, so the new daemon's messages go nowhere. NON_UNIQUE makes each
+    // spawn own its own windows.
     let app = if args.pick {
         gtk::Application::builder()
             .application_id("io.ceifa.papagaia.picker")
@@ -63,6 +67,7 @@ fn main() -> Result<()> {
     } else {
         gtk::Application::builder()
             .application_id("io.ceifa.papagaia.overlay")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
             .build()
     };
 
@@ -324,8 +329,6 @@ fn parse_picker_raw(text: &str) -> Option<PickerResult> {
 
     Some(PickerResult::Raw {
         template: text.to_string(),
-        strip_markdown_fences: false,
-        trim_whitespace: true,
         stream_output: true,
     })
 }
@@ -784,13 +787,9 @@ mod tests {
         match result {
             PickerResult::Raw {
                 template,
-                strip_markdown_fences,
-                trim_whitespace,
                 stream_output,
             } => {
                 assert_eq!(template, "Fix this: {{text}}");
-                assert!(!strip_markdown_fences);
-                assert!(trim_whitespace);
                 assert!(stream_output);
             }
             PickerResult::Template { .. } => panic!("expected raw picker result"),

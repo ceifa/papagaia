@@ -17,10 +17,6 @@ pub enum ClientRequest {
         selected_text: Option<String>,
         #[serde(default)]
         preserve_selection: bool,
-        #[serde(default = "crate::default_true")]
-        strip_markdown_fences: bool,
-        #[serde(default = "crate::default_true")]
-        trim_whitespace: bool,
         #[serde(default)]
         stream_output: bool,
     },

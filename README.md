@@ -34,7 +34,7 @@ papagaia prompt raw --text 'Rewrite clearly: {{text}}'   # ad-hoc prompt
 
 Ad-hoc prompts without `{{text}}` automatically append the selection. You can also pipe via `--stdin`.
 
-Add `--stream-output` to type results incrementally into the target app (incompatible with `strip_markdown_fences`).
+Add `--stream-output` to type results incrementally into the target app.
 
 ### Dictation
 
@@ -71,8 +71,6 @@ Config lives at `~/.config/papagaia/config.toml` (run `papagaia config-path` to 
 | `[dictation]` | Post-processing, streaming, context capture, audio debug |
 | `[engine]` | LLM CLI for text transformation |
 | `[[prompts]]` | Saved prompt templates and cleanup options |
-
-`papagaia init` auto-detects engines like `codex`, `claude`, `gh copilot`, `llama.cpp`, and `gemini`.
 
 ## Troubleshooting
 
