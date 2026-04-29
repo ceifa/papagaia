@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 use papagaia_core::{ClientRequest, ClientResponse, Config, OverlayMessage, PromptConfig};
 use tokio::{
     sync::{Mutex, mpsc},
+    task::JoinHandle,
     time::{Duration, sleep},
 };
 
@@ -44,6 +45,11 @@ struct RecordingSession {
     recorder: Recorder,
     context: DictationContext,
     overlay_epoch: u64,
+    /// Forwards mic-level samples to the overlay. Aborted on every transition
+    /// out of `Recording` so trailing samples (the capture thread can push one
+    /// more RMS after the stop flag is set) don't land in the overlay channel
+    /// after we've already sent the next state's message.
+    level_forwarder: JoinHandle<()>,
 }
 
 #[derive(Default)]
@@ -300,7 +306,7 @@ impl App {
             let (level_tx, mut level_rx) = mpsc::unbounded_channel();
             let recorder = Recorder::start(level_tx)?;
             let overlay = self.overlay.clone();
-            tokio::spawn(async move {
+            let level_forwarder = tokio::spawn(async move {
                 while let Some(level) = level_rx.recv().await {
                     overlay
                         .send(OverlayMessage::Recording {
@@ -315,6 +321,7 @@ impl App {
                 recorder,
                 context,
                 overlay_epoch,
+                level_forwarder,
             });
         }
 
@@ -345,6 +352,10 @@ impl App {
             let State::Recording(session) = std::mem::replace(&mut *state, State::Idle) else {
                 unreachable!()
             };
+            // Same race as in `cancel`: kill the forwarder before we send the
+            // Busy(Transcribing) message so trailing Recording samples can't
+            // overwrite it.
+            session.level_forwarder.abort();
             let overlay_epoch = session.overlay_epoch;
             *state = State::Busy {
                 label: "transcribing".into(),
@@ -469,6 +480,13 @@ impl App {
         let mut state = self.state.lock().await;
         match std::mem::replace(&mut *state, State::Idle) {
             State::Recording(session) => {
+                // Abort the level forwarder before doing anything else: the
+                // capture thread can push one final RMS sample between when
+                // we set the stop flag (inside Recorder::drop) and when its
+                // current `readi` call returns. Without this abort, that
+                // trailing Recording message lands in the overlay channel
+                // after our Hidden, and the overlay sticks at "Listening…".
+                session.level_forwarder.abort();
                 drop(session.recorder);
                 drop(state);
                 self.overlay.send(OverlayMessage::Hidden).await;
@@ -506,6 +524,7 @@ impl App {
                 State::Recording(session) if session.overlay_epoch == recording_epoch => {
                     let old = std::mem::replace(&mut *state, State::Idle);
                     if let State::Recording(session) = old {
+                        session.level_forwarder.abort();
                         drop(session.recorder);
                     }
                     true

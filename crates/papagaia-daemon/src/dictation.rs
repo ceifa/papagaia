@@ -1,81 +1,82 @@
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
 };
 
-use anyhow::{Context, Result, bail};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use alsa::{
+    Direction, ValueOr,
+    pcm::{Access, Format, HwParams, PCM},
+};
+use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
+const WHISPER_SAMPLE_RATE: u32 = 16000;
+pub const MAX_RECORDING_SECS: u64 = 3600; // 1 hour
+const FRAMES_PER_READ: usize = 1024;
+
 pub struct Recorder {
-    stream: cpal::Stream,
-    sample_rate: u32,
-    channels: u16,
-    samples: Arc<Mutex<Vec<i16>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+    samples: Option<Arc<Mutex<Vec<i16>>>>,
 }
 
 impl Recorder {
     pub fn start(level_tx: mpsc::UnboundedSender<f32>) -> Result<Self> {
-        let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .context("no default input device available")?;
-        let supported_config = device
-            .default_input_config()
-            .context("failed to load default input config")?;
+        // The "default" ALSA device on a normal Linux desktop is the plug
+        // device — it transparently performs sample-rate conversion, channel
+        // downmix, and format conversion in libasound. We can therefore ask it
+        // directly for whisper's expected format (16 kHz, mono, S16) and skip
+        // the in-process resampling entirely.
+        let pcm = PCM::new("default", Direction::Capture, false)
+            .context("failed to open the default ALSA capture device")?;
 
-        let sample_rate = supported_config.sample_rate().0;
-        let channels = supported_config.channels();
-        let max_samples = sample_rate as usize * channels as usize * MAX_RECORDING_SECS as usize;
-        let samples = Arc::new(Mutex::new(Vec::new()));
-        let samples_for_callback = samples.clone();
-        let level_tx_f32 = level_tx.clone();
-        let level_tx_i16 = level_tx.clone();
-        let level_tx_u16 = level_tx;
-        let error_callback = |error| eprintln!("papagaia recorder error: {error}");
+        {
+            let hwp = HwParams::any(&pcm).context("failed to read ALSA hw params")?;
+            hwp.set_access(Access::RWInterleaved)
+                .context("ALSA: failed to set RWInterleaved access")?;
+            hwp.set_format(Format::s16())
+                .context("ALSA: failed to set S16 format")?;
+            hwp.set_channels(1)
+                .context("ALSA: failed to set mono channel layout")?;
+            hwp.set_rate(WHISPER_SAMPLE_RATE, ValueOr::Nearest)
+                .context("ALSA: failed to set 16 kHz sample rate")?;
+            pcm.hw_params(&hwp)
+                .context("ALSA: failed to apply hw params")?;
+        }
+        pcm.start().context("ALSA: failed to start capture")?;
 
-        let stream_config = supported_config.config();
-        let stream = match supported_config.sample_format() {
-            cpal::SampleFormat::F32 => device.build_input_stream(
-                &stream_config,
-                move |data: &[f32], _| {
-                    push_f32_samples(data, &samples_for_callback, &level_tx_f32, max_samples);
-                },
-                error_callback,
-                None,
-            )?,
-            cpal::SampleFormat::I16 => device.build_input_stream(
-                &stream_config,
-                move |data: &[i16], _| {
-                    push_i16_samples(data, &samples_for_callback, &level_tx_i16, max_samples);
-                },
-                error_callback,
-                None,
-            )?,
-            cpal::SampleFormat::U16 => device.build_input_stream(
-                &stream_config,
-                move |data: &[u16], _| {
-                    push_u16_samples(data, &samples_for_callback, &level_tx_u16, max_samples);
-                },
-                error_callback,
-                None,
-            )?,
-            sample_format => bail!("unsupported input sample format {sample_format:?}"),
-        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let samples: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
+        let max_samples = WHISPER_SAMPLE_RATE as usize * MAX_RECORDING_SECS as usize;
 
-        stream.play().context("failed to start input stream")?;
+        let stop_for_thread = stop.clone();
+        let samples_for_thread = samples.clone();
+        let handle = thread::spawn(move || {
+            capture_loop(pcm, stop_for_thread, samples_for_thread, level_tx, max_samples);
+        });
 
         Ok(Self {
-            stream,
-            sample_rate,
-            channels,
-            samples,
+            stop,
+            handle: Some(handle),
+            samples: Some(samples),
         })
     }
 
     /// Stops recording and writes a WAV file. Returns the path and duration in seconds.
-    pub fn finish(self) -> Result<(PathBuf, f64)> {
-        drop(self.stream);
+    pub fn finish(mut self) -> Result<(PathBuf, f64)> {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+
+        let samples_arc = self.samples.take().expect("samples taken twice");
+        let samples = Arc::try_unwrap(samples_arc)
+            .map(|mutex| mutex.into_inner().expect("recorder sample lock poisoned"))
+            .unwrap_or_else(|arc| arc.lock().expect("recorder sample lock poisoned").clone());
 
         let audio_path = std::env::temp_dir().join(format!(
             "papagaia-{}.wav",
@@ -84,12 +85,7 @@ impl Recorder {
                 .as_millis()
         ));
 
-        let samples = Arc::try_unwrap(self.samples)
-            .map(|mutex| mutex.into_inner().expect("recorder sample lock poisoned"))
-            .unwrap_or_else(|arc| arc.lock().expect("recorder sample lock poisoned").clone());
-
-        let prepared = prepare_for_whisper(&samples, self.channels, self.sample_rate);
-        let duration_secs = prepared.len() as f64 / WHISPER_SAMPLE_RATE as f64;
+        let duration_secs = samples.len() as f64 / WHISPER_SAMPLE_RATE as f64;
 
         let spec = hound::WavSpec {
             channels: 1,
@@ -101,7 +97,7 @@ impl Recorder {
         let mut writer = hound::WavWriter::create(&audio_path, spec)
             .with_context(|| format!("failed to create {}", audio_path.display()))?;
 
-        for sample in prepared {
+        for sample in samples {
             writer.write_sample(sample)?;
         }
         writer.finalize()?;
@@ -110,120 +106,83 @@ impl Recorder {
     }
 }
 
-const WHISPER_SAMPLE_RATE: u32 = 16000;
-pub const MAX_RECORDING_SECS: u64 = 3600; // 1 hour
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
-fn prepare_for_whisper(interleaved: &[i16], channels: u16, sample_rate: u32) -> Vec<i16> {
-    let mono = downmix_to_mono(interleaved, channels);
-    let resampled = if sample_rate == WHISPER_SAMPLE_RATE {
-        mono
-    } else {
-        resample(&mono, sample_rate, WHISPER_SAMPLE_RATE)
+fn capture_loop(
+    pcm: PCM,
+    stop: Arc<AtomicBool>,
+    samples: Arc<Mutex<Vec<i16>>>,
+    level_tx: mpsc::UnboundedSender<f32>,
+    max_samples: usize,
+) {
+    let io = match pcm.io_i16() {
+        Ok(io) => io,
+        Err(error) => {
+            eprintln!("papagaia recorder: failed to acquire ALSA i16 io handle: {error}");
+            return;
+        }
     };
-    resampled
-        .into_iter()
-        .map(|sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-        .collect()
-}
 
-fn downmix_to_mono(interleaved: &[i16], channels: u16) -> Vec<f32> {
-    let channels = channels.max(1) as usize;
-    let scale = 1.0 / (i16::MAX as f32 * channels as f32);
-    interleaved
-        .chunks_exact(channels)
-        .map(|frame| frame.iter().map(|sample| *sample as f32).sum::<f32>() * scale)
-        .collect()
-}
-
-// Resamples mono audio using a box-filter kernel. The averaging window acts as
-// a cheap anti-aliasing filter when downsampling, which is the common case
-// (device rates of 44.1/48 kHz down to 16 kHz). For the rare upsampling case
-// the window collapses to a single source sample (nearest neighbour).
-fn resample(samples: &[f32], input_rate: u32, output_rate: u32) -> Vec<f32> {
-    if samples.is_empty() || input_rate == output_rate {
-        return samples.to_vec();
-    }
-
-    let ratio = input_rate as f64 / output_rate as f64;
-    let output_len = ((samples.len() as f64) / ratio).floor() as usize;
-    let mut output = Vec::with_capacity(output_len);
-
-    for i in 0..output_len {
-        let start = (i as f64 * ratio) as usize;
-        let end = (((i + 1) as f64 * ratio) as usize)
-            .max(start + 1)
-            .min(samples.len());
-        let slice = &samples[start..end];
-        let avg = slice.iter().sum::<f32>() / slice.len() as f32;
-        output.push(avg);
-    }
-
-    output
-}
-
-fn push_f32_samples(
-    data: &[f32],
-    samples: &Arc<Mutex<Vec<i16>>>,
-    level_tx: &mpsc::UnboundedSender<f32>,
-    max_samples: usize,
-) {
-    let converted: Vec<i16> = data
-        .iter()
-        .map(|sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-        .collect();
-    push_samples(&converted, samples, level_tx, max_samples);
-}
-
-fn push_i16_samples(
-    data: &[i16],
-    samples: &Arc<Mutex<Vec<i16>>>,
-    level_tx: &mpsc::UnboundedSender<f32>,
-    max_samples: usize,
-) {
-    push_samples(data, samples, level_tx, max_samples);
-}
-
-fn push_u16_samples(
-    data: &[u16],
-    samples: &Arc<Mutex<Vec<i16>>>,
-    level_tx: &mpsc::UnboundedSender<f32>,
-    max_samples: usize,
-) {
-    let converted: Vec<i16> = data
-        .iter()
-        .map(|sample| (*sample as i32 - i16::MAX as i32 - 1) as i16)
-        .collect();
-    push_samples(&converted, samples, level_tx, max_samples);
-}
-
-fn push_samples(
-    data: &[i16],
-    samples: &Arc<Mutex<Vec<i16>>>,
-    level_tx: &mpsc::UnboundedSender<f32>,
-    max_samples: usize,
-) {
-    if let Ok(mut collected) = samples.lock() {
-        let current = collected.len();
-        if current < max_samples {
-            let remaining = max_samples - current;
-            if data.len() <= remaining {
-                collected.extend_from_slice(data);
-            } else {
-                collected.extend_from_slice(&data[..remaining]);
+    let mut buf = [0_i16; FRAMES_PER_READ];
+    while !stop.load(Ordering::Acquire) {
+        let frames = match io.readi(&mut buf) {
+            Ok(n) => n,
+            Err(error) => {
+                // Recover from underrun/overrun (xrun) and try again. Other
+                // errors abort the loop — there's no useful retry.
+                if pcm.recover(error.errno(), true).is_err() {
+                    eprintln!("papagaia recorder error: {error}");
+                    break;
+                }
+                continue;
             }
+        };
+
+        if frames == 0 {
+            continue;
+        }
+
+        let chunk = &buf[..frames];
+        push_samples(chunk, &samples, max_samples);
+        if let Some(rms) = compute_rms(chunk) {
+            let _ = level_tx.send(rms);
         }
     }
 
-    if !data.is_empty() {
-        let rms = (data
-            .iter()
-            .map(|sample| {
-                let sample = *sample as f32 / i16::MAX as f32;
-                sample * sample
-            })
-            .sum::<f32>()
-            / data.len() as f32)
-            .sqrt();
-        let _ = level_tx.send(rms.clamp(0.0, 1.0));
+    let _ = pcm.drop();
+}
+
+fn push_samples(data: &[i16], samples: &Arc<Mutex<Vec<i16>>>, max_samples: usize) {
+    let Ok(mut collected) = samples.lock() else {
+        return;
+    };
+    let current = collected.len();
+    if current >= max_samples {
+        return;
     }
+    let remaining = max_samples - current;
+    let take = data.len().min(remaining);
+    collected.extend_from_slice(&data[..take]);
+}
+
+fn compute_rms(data: &[i16]) -> Option<f32> {
+    if data.is_empty() {
+        return None;
+    }
+    let sum_sq: f32 = data
+        .iter()
+        .map(|sample| {
+            let normalized = *sample as f32 / i16::MAX as f32;
+            normalized * normalized
+        })
+        .sum();
+    let rms = (sum_sq / data.len() as f32).sqrt();
+    Some(rms.clamp(0.0, 1.0))
 }

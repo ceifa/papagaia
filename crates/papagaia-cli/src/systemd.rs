@@ -31,6 +31,10 @@ pub fn install() -> Result<PathBuf> {
         .with_context(|| format!("failed to write {}", unit_path.display()))?;
 
     run_systemctl(&["daemon-reload"])?;
+    // Drop any stale [Install] symlinks (e.g. older versions wired the unit
+    // into default.target, which subverts the WAYLAND_DISPLAY ordering we now
+    // depend on) before re-enabling against the current [Install] section.
+    let _ = run_systemctl(&["disable", UNIT_NAME]);
     run_systemctl(&["enable", "--now", UNIT_NAME])?;
 
     restart()?;
@@ -59,9 +63,16 @@ pub fn is_enabled() -> bool {
 }
 
 fn render_unit(daemon_binary: &Path) -> String {
+    // The overlay is a GTK4 + layer-shell client, so the daemon must inherit
+    // WAYLAND_DISPLAY from the compositor. graphical-session.target is the
+    // synchronization point niri/sway/hyprland reach *after* importing their
+    // session env into the systemd user manager — bind here so we never race
+    // and spawn the overlay against an empty environment.
     format!(
         "[Unit]\n\
          Description=papagaia daemon\n\
+         PartOf=graphical-session.target\n\
+         After=graphical-session.target\n\
          \n\
          [Service]\n\
          Type=simple\n\
@@ -70,7 +81,7 @@ fn render_unit(daemon_binary: &Path) -> String {
          RestartSec=2\n\
          \n\
          [Install]\n\
-         WantedBy=default.target\n",
+         WantedBy=graphical-session.target\n",
         daemon_binary.display()
     )
 }

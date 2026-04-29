@@ -16,7 +16,7 @@ use tokio::{
     signal,
 };
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let config = Config::load()?;
     let runtime_dir = runtime_dir()?;
