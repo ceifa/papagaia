@@ -48,6 +48,7 @@ const STATE_CLASSES: &[&str] = &[
     "state-recording",
     "state-success",
     "state-error",
+    "state-notice",
 ];
 
 fn main() -> Result<()> {
@@ -172,14 +173,11 @@ fn build_picker_ui(app: &gtk::Application, entries: Vec<PickerEntry>) {
     let filter_entries = entries.clone();
     let filter_input = input.clone();
     list_box.set_filter_func(move |row| {
-        let text = filter_input.text().to_string().to_lowercase();
-        if text.is_empty() {
-            return true;
-        }
+        let text = filter_input.text().to_string();
         let index = row.index() as usize;
         filter_entries
             .get(index)
-            .is_some_and(|e| e.name.to_lowercase().contains(&text))
+            .is_some_and(|e| picker_matches(e, &text))
     });
 
     let list_for_changed = list_box.clone();
@@ -257,13 +255,42 @@ fn build_picker_ui(app: &gtk::Application, entries: Vec<PickerEntry>) {
 }
 
 fn picker_visible_indices(entries: &[PickerEntry], filter_text: &str) -> Vec<i32> {
-    let filter = filter_text.to_lowercase();
     entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| filter.is_empty() || e.name.to_lowercase().contains(&filter))
+        .filter(|(_, e)| picker_matches(e, filter_text))
         .map(|(i, _)| i as i32)
         .collect()
+}
+
+/// Whether a prompt entry matches the picker query. The query is matched as a
+/// fuzzy subsequence against both the prompt name and its summary, so users can
+/// type loosely ("fg" → "fix-grammar") or search by what a prompt does.
+fn picker_matches(entry: &PickerEntry, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let haystack = format!("{} {}", entry.name, entry.summary).to_lowercase();
+    fuzzy_subsequence(&haystack, &query)
+}
+
+/// True when every non-whitespace char of `query` appears in `haystack` in
+/// order (not necessarily contiguously).
+fn fuzzy_subsequence(haystack: &str, query: &str) -> bool {
+    let mut hay = haystack.chars();
+    'needle: for needle in query.chars() {
+        if needle.is_whitespace() {
+            continue;
+        }
+        for c in hay.by_ref() {
+            if c == needle {
+                continue 'needle;
+            }
+        }
+        return false;
+    }
+    true
 }
 
 fn picker_auto_select(list: &gtk::ListBox, entries: &[PickerEntry], filter_text: &str) {
@@ -403,21 +430,22 @@ fn build_ui(app: &gtk::Application) {
         message,
         bars,
         spinner_frame: Cell::new(0),
+        opacity: Cell::new(0.0),
+        target_opacity: Cell::new(0.0),
+        pending_hide: Cell::new(false),
+        shown: Cell::new(false),
+        render_source: RefCell::new(None),
+        spinner_source: RefCell::new(None),
     });
 
-    let spinner_state = Rc::clone(&state);
-    glib::timeout_add_local(std::time::Duration::from_millis(90), move || {
-        if spinner_state.card.has_css_class("state-busy") {
-            let next = (spinner_state.spinner_frame.get() + 1) % BRAILLE_FRAMES.len() as u32;
-            spinner_state.spinner_frame.set(next);
-            spinner_state
-                .glyph
-                .set_markup(&mono(BRAILLE_FRAMES[next as usize]));
-        }
-        ControlFlow::Continue
-    });
-
-    let (tx, rx) = std::sync::mpsc::channel::<OverlayMessage>();
+    // Deliver overlay messages event-driven rather than polling. A blocking
+    // stdin reader thread forwards parsed messages over an async channel; the
+    // local future below wakes only when one arrives. The HUD is hidden the vast
+    // majority of the time, so the previous always-on 33ms poll (plus the 90ms
+    // spinner timer) burned ~40 wakeups/second forever for nothing. Now an idle
+    // overlay schedules no timers at all — the animation ticks are armed only
+    // while there is something to animate (see `ensure_render_tick`).
+    let (tx, rx) = async_channel::unbounded::<OverlayMessage>();
     thread::spawn(move || {
         let stdin = io::stdin();
         let mut locked = stdin.lock();
@@ -428,7 +456,7 @@ fn build_ui(app: &gtk::Application) {
                 Ok(0) => break,
                 Ok(_) => {
                     if let Ok(message) = serde_json::from_str::<OverlayMessage>(&line)
-                        && tx.send(message).is_err()
+                        && tx.send_blocking(message).is_err()
                     {
                         break;
                     }
@@ -438,14 +466,68 @@ fn build_ui(app: &gtk::Application) {
         }
     });
 
-    let receiver = Rc::new(RefCell::new(rx));
     let apply_state = Rc::clone(&state);
-    glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
-        while let Ok(message) = receiver.borrow_mut().try_recv() {
+    glib::spawn_future_local(async move {
+        while let Ok(message) = rx.recv().await {
             apply_message(&apply_state, message);
+            // Any message either starts a fade-in, a fade-out, or live bars, so
+            // make sure the animation tick is running to carry it to rest.
+            ensure_render_tick(&apply_state);
         }
-        ControlFlow::Continue
     });
+}
+
+/// Arms the ~33ms animation tick if it isn't already running. The tick advances
+/// the fade and the recording bars, then suspends itself once everything has
+/// settled, so an idle/hidden overlay holds no timer.
+fn ensure_render_tick(state: &Rc<UiState>) {
+    if state.render_source.borrow().is_some() {
+        return;
+    }
+    let tick_state = Rc::clone(state);
+    let id = glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
+        step_opacity(&tick_state);
+        if tick_state.shown.get() && tick_state.card.has_css_class("state-recording") {
+            step_bars(&tick_state.bars);
+        }
+        if is_animating(&tick_state) {
+            ControlFlow::Continue
+        } else {
+            *tick_state.render_source.borrow_mut() = None;
+            ControlFlow::Break
+        }
+    });
+    *state.render_source.borrow_mut() = Some(id);
+}
+
+/// Whether the render tick still has work: a fade in progress, or live mic bars
+/// while the recording HUD is visible.
+fn is_animating(state: &UiState) -> bool {
+    (state.opacity.get() - state.target_opacity.get()).abs() > 0.001
+        || (state.shown.get() && state.card.has_css_class("state-recording"))
+}
+
+/// Arms the 90ms spinner tick if it isn't already running. Suspends itself as
+/// soon as the overlay leaves the busy state.
+fn ensure_spinner(state: &Rc<UiState>) {
+    if state.spinner_source.borrow().is_some() {
+        return;
+    }
+    let spinner_state = Rc::clone(state);
+    let id = glib::timeout_add_local(std::time::Duration::from_millis(90), move || {
+        if spinner_state.shown.get() && spinner_state.card.has_css_class("state-busy") {
+            let next = (spinner_state.spinner_frame.get() + 1) % BRAILLE_FRAMES.len() as u32;
+            spinner_state.spinner_frame.set(next);
+            spinner_state
+                .glyph
+                .set_markup(&mono(BRAILLE_FRAMES[next as usize]));
+            ControlFlow::Continue
+        } else {
+            *spinner_state.spinner_source.borrow_mut() = None;
+            ControlFlow::Break
+        }
+    });
+    *state.spinner_source.borrow_mut() = Some(id);
 }
 
 struct UiState {
@@ -455,11 +537,30 @@ struct UiState {
     message: gtk::Label,
     bars: Bars,
     spinner_frame: Cell<u32>,
+    /// Current card opacity, driven toward `target_opacity` by the render tick
+    /// so every show/hide eases instead of snapping.
+    opacity: Cell<f64>,
+    target_opacity: Cell<f64>,
+    /// When set, the card is fading out and the window is hidden for real once
+    /// opacity reaches zero.
+    pending_hide: Cell<bool>,
+    /// Whether the window is currently mapped. Lets us start a fresh fade-in
+    /// only on the transition from hidden to visible.
+    shown: Cell<bool>,
+    /// Handle to the running animation tick, if any. `None` means no tick is
+    /// scheduled (idle overlay), so `ensure_render_tick` knows to start one.
+    render_source: RefCell<Option<glib::SourceId>>,
+    /// Handle to the running spinner tick, if any.
+    spinner_source: RefCell<Option<glib::SourceId>>,
 }
 
 struct Bars {
     container: gtk::Box,
     widgets: Vec<gtk::LevelBar>,
+    /// Per-bar displayed values, eased toward `targets` each render tick so the
+    /// meter glides instead of stepping on every (~64ms) mic sample.
+    values: RefCell<Vec<f64>>,
+    targets: RefCell<Vec<f64>>,
 }
 
 fn build_bars() -> Bars {
@@ -484,7 +585,13 @@ fn build_bars() -> Bars {
         container.append(&bar);
     }
     container.hide();
-    Bars { container, widgets }
+    let count = widgets.len();
+    Bars {
+        container,
+        widgets,
+        values: RefCell::new(vec![0.05; count]),
+        targets: RefCell::new(vec![0.05; count]),
+    }
 }
 
 fn set_state_class(state: &UiState, name: &str) {
@@ -503,24 +610,21 @@ fn mono(text: &str) -> String {
     )
 }
 
-fn apply_message(state: &UiState, message: OverlayMessage) {
+fn apply_message(state: &Rc<UiState>, message: OverlayMessage) {
     match message {
         OverlayMessage::Hidden => {
-            state.bars.container.hide();
-            state
-                .window
-                .set_keyboard_mode(layer_shell::KeyboardMode::None);
-            state.window.hide();
-            set_state_class(state, "state-idle");
+            begin_hide(state);
         }
         OverlayMessage::Busy {
             label,
             grab_keyboard,
         } => {
             set_state_class(state, "state-busy");
-            state
-                .glyph
-                .set_markup(&mono(BRAILLE_FRAMES[state.spinner_frame.get() as usize]));
+            // Restart the spinner from frame 0 so every busy phase begins at a
+            // consistent point instead of wherever the previous cycle stopped.
+            state.spinner_frame.set(0);
+            state.glyph.set_markup(&mono(BRAILLE_FRAMES[0]));
+            ensure_spinner(state);
             state.bars.container.hide();
             state.message.set_label(&label);
             // Exclusive keyboard focus is how Esc-to-cancel actually works on
@@ -534,11 +638,7 @@ fn apply_message(state: &UiState, message: OverlayMessage) {
                 layer_shell::KeyboardMode::None
             };
             state.window.set_keyboard_mode(mode);
-            if grab_keyboard {
-                state.window.present();
-            } else {
-                state.window.show();
-            }
+            request_show(state, grab_keyboard);
         }
         OverlayMessage::Recording { level, transcript } => {
             set_state_class(state, "state-recording");
@@ -552,8 +652,8 @@ fn apply_message(state: &UiState, message: OverlayMessage) {
             state
                 .window
                 .set_keyboard_mode(layer_shell::KeyboardMode::Exclusive);
-            state.window.present();
-            set_bars(&state.bars.widgets, level);
+            set_bar_targets(&state.bars, level);
+            request_show(state, true);
         }
         OverlayMessage::Result { ok, message } => {
             if ok {
@@ -568,19 +668,110 @@ fn apply_message(state: &UiState, message: OverlayMessage) {
             state
                 .window
                 .set_keyboard_mode(layer_shell::KeyboardMode::None);
-            state.window.show();
+            request_show(state, false);
+        }
+        OverlayMessage::Notice { message } => {
+            set_state_class(state, "state-notice");
+            state.glyph.set_markup(&mono("·"));
+            state.bars.container.hide();
+            state.message.set_label(&message);
+            state
+                .window
+                .set_keyboard_mode(layer_shell::KeyboardMode::None);
+            request_show(state, false);
         }
     }
 }
 
-fn set_bars(bars: &[gtk::LevelBar], level: f32) {
+/// Maps the latest mic level onto per-bar target heights. The displayed bars
+/// then ease toward these in `step_bars` so the meter never jumps.
+fn set_bar_targets(bars: &Bars, level: f32) {
     // Apply sqrt to convert linear RMS into a perceptually-proportional scale.
     // Raw RMS for speech is typically 0.02–0.15; sqrt expands that into a
     // range where bar movement is clearly visible across the full volume span.
     let perceptual = level.sqrt();
     let multipliers = [0.35, 0.58, 0.82, 1.0, 0.82, 0.58, 0.35];
-    for (bar, factor) in bars.iter().zip(multipliers) {
-        bar.set_value((perceptual * 2.5 * factor).clamp(0.05, 1.0) as f64);
+    let mut targets = bars.targets.borrow_mut();
+    for (target, factor) in targets.iter_mut().zip(multipliers) {
+        *target = (perceptual * 2.5 * factor).clamp(0.05, 1.0) as f64;
+    }
+}
+
+/// Eases each bar toward its target with a fast attack and slower release —
+/// the same asymmetry real VU meters use, so loud peaks snap up but decay back
+/// down smoothly.
+fn step_bars(bars: &Bars) {
+    let targets = bars.targets.borrow();
+    let mut values = bars.values.borrow_mut();
+    for ((bar, value), &target) in bars
+        .widgets
+        .iter()
+        .zip(values.iter_mut())
+        .zip(targets.iter())
+    {
+        let smoothing = if target > *value { 0.6 } else { 0.25 };
+        *value += (target - *value) * smoothing;
+        bar.set_value(value.clamp(0.05, 1.0));
+    }
+}
+
+/// Marks the overlay to fade in (or stay visible) and presents/shows the
+/// window. A fresh fade-in only starts on the hidden→visible transition.
+fn request_show(state: &UiState, present: bool) {
+    if !state.shown.get() {
+        state.opacity.set(0.0);
+        state.card.set_opacity(0.0);
+        state.shown.set(true);
+    }
+    state.pending_hide.set(false);
+    state.target_opacity.set(1.0);
+    if present {
+        state.window.present();
+    } else {
+        state.window.show();
+    }
+}
+
+/// Begins a fade-out. The window is unmapped for real by `step_opacity` once
+/// the card reaches full transparency.
+fn begin_hide(state: &UiState) {
+    state
+        .window
+        .set_keyboard_mode(layer_shell::KeyboardMode::None);
+    if !state.shown.get() {
+        finish_hide(state);
+        return;
+    }
+    state.pending_hide.set(true);
+    state.target_opacity.set(0.0);
+}
+
+fn finish_hide(state: &UiState) {
+    state.window.hide();
+    state.bars.container.hide();
+    state.shown.set(false);
+    state.pending_hide.set(false);
+    set_state_class(state, "state-idle");
+}
+
+/// Advances the card's fade animation by one render frame (~33ms). A step of
+/// 0.2 makes a full fade take ~5 frames (~165ms).
+fn step_opacity(state: &UiState) {
+    let current = state.opacity.get();
+    let target = state.target_opacity.get();
+    if (current - target).abs() <= 0.001 {
+        return;
+    }
+    const STEP: f64 = 0.2;
+    let next = if current < target {
+        (current + STEP).min(target)
+    } else {
+        (current - STEP).max(target)
+    };
+    state.opacity.set(next);
+    state.card.set_opacity(next);
+    if state.pending_hide.get() && next <= 0.001 {
+        finish_hide(state);
     }
 }
 
@@ -652,6 +843,10 @@ fn install_css() {
             border-radius: 12px;
             border-left: 3px solid @borders;
             min-width: 180px;
+            transition: border-left-color 220ms ease,
+                        border-top-color 220ms ease,
+                        border-right-color 220ms ease,
+                        border-bottom-color 220ms ease;
         }
 
         .glyph {
@@ -659,6 +854,7 @@ fn install_css() {
             font-weight: 700;
             color: alpha(@card_fg_color, 0.55);
             min-width: 14px;
+            transition: color 200ms ease;
         }
 
         .message {
@@ -679,6 +875,7 @@ fn install_css() {
             border-radius: 2px;
             min-width: 3px;
             box-shadow: 0 0 8px alpha(@warning_color, 0.55);
+            transition: background-color 200ms ease, box-shadow 200ms ease;
         }
 
         levelbar.wave block.empty {
@@ -690,7 +887,16 @@ fn install_css() {
         .state-busy .glyph { color: @accent_bg_color; }
 
         .state-recording.papagaia-card { border-left-color: @warning_color; }
-        .state-recording .glyph { color: @warning_color; }
+        .state-recording .glyph {
+            color: @warning_color;
+            animation: papagaia-rec-pulse 1.4s ease-in-out infinite;
+        }
+
+        @keyframes papagaia-rec-pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.3; }
+            100% { opacity: 1; }
+        }
 
         .state-success.papagaia-card {
             border-left-color: @success_color;
@@ -707,6 +913,10 @@ fn install_css() {
             border-bottom-color: alpha(@error_color, 0.26);
         }
         .state-error .glyph { color: @error_color; }
+
+        .state-notice.papagaia-card { border-left-color: @borders; }
+        .state-notice .glyph { color: alpha(@card_fg_color, 0.45); }
+        .state-notice .message { color: alpha(@card_fg_color, 0.7); }
 
         /* --- Picker --- */
 
@@ -779,7 +989,33 @@ fn install_css() {
 
 #[cfg(test)]
 mod tests {
-    use super::{PickerResult, parse_picker_raw};
+    use super::{PickerEntry, PickerResult, parse_picker_raw, picker_matches};
+
+    fn entry(name: &str, summary: &str) -> PickerEntry {
+        PickerEntry {
+            name: name.into(),
+            summary: summary.into(),
+        }
+    }
+
+    #[test]
+    fn picker_matches_empty_query_matches_everything() {
+        assert!(picker_matches(&entry("shorten", "Make it shorter"), "  "));
+    }
+
+    #[test]
+    fn picker_matches_fuzzy_subsequence_on_name() {
+        let e = entry("fix-grammar", "Correct grammar and spelling");
+        assert!(picker_matches(&e, "fg"));
+        assert!(picker_matches(&e, "fixgram"));
+        assert!(!picker_matches(&e, "gf"));
+    }
+
+    #[test]
+    fn picker_matches_searches_summary_too() {
+        let e = entry("shorten", "Make it shorter but keep the meaning");
+        assert!(picker_matches(&e, "meaning"));
+    }
 
     #[test]
     fn plain_picker_text_uses_streaming_raw_defaults() {

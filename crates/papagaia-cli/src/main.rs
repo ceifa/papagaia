@@ -346,6 +346,13 @@ fn run_pick() -> Result<()> {
 }
 
 fn run_restart() -> Result<()> {
+    if !systemd::unit_path()?.exists() {
+        bail!(
+            "no systemd user unit is installed, so there is nothing to restart. \
+             If you started the daemon manually, stop it (e.g. `pkill papagaia-daemon`) \
+             and launch `papagaia-daemon` again, or run `papagaia init` to install the service."
+        );
+    }
     systemd::restart()?;
     println!("daemon restarted");
     Ok(())
@@ -700,16 +707,8 @@ fn run_doctor() -> Result<()> {
         CheckLevel::Required,
         "install `wtype` or point `paste_command` to another compatible tool",
     );
-    command_check(
-        &mut checks,
-        "type text injection",
-        &config.tools.type_command,
-        CheckLevel::Required,
-        "install `wtype` or point `type_command` to another compatible tool",
-    );
     if uses_command(&config.tools.copy_command, "ydotool")
         || uses_command(&config.tools.paste_command, "ydotool")
-        || uses_command(&config.tools.type_command, "ydotool")
     {
         command_check(
             &mut checks,
@@ -727,16 +726,24 @@ fn run_doctor() -> Result<()> {
         "install `whisper.cpp` if you want dictation",
     );
 
-    command_check(
-        &mut checks,
-        "configured engine",
-        &config.engine.argv,
-        CheckLevel::Optional,
-        &format!(
-            "install the configured engine command or edit [engine] in {}",
-            config_path.display()
-        ),
-    );
+    let multiple_engines = config.engine.len() > 1;
+    for (index, engine) in config.engine.iter().enumerate() {
+        let label = if multiple_engines {
+            format!("configured engine #{}", index + 1)
+        } else {
+            "configured engine".to_string()
+        };
+        command_check(
+            &mut checks,
+            &label,
+            &engine.argv,
+            CheckLevel::Optional,
+            &format!(
+                "install the configured engine command or edit [engine] in {}",
+                config_path.display()
+            ),
+        );
+    }
 
     let systemd_unit_path = systemd::unit_path()?;
     checks.push(DoctorCheck {
@@ -874,12 +881,16 @@ fn run_doctor() -> Result<()> {
     );
     println!(
         "- configured engine: {}",
-        config
-            .engine
-            .argv
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "<unset>".into())
+        if config.engine.is_empty() {
+            "<unset>".to_string()
+        } else {
+            config
+                .engine
+                .iter()
+                .map(|engine| engine.argv.first().map(String::as_str).unwrap_or("<unset>"))
+                .collect::<Vec<_>>()
+                .join(" → ")
+        }
     );
     println!(
         "- daemon: {}",
@@ -953,7 +964,7 @@ fn render_init_config(environment: &DetectedEnvironment, options: &InitOptions) 
         .as_ref()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "~/.local/share/whisper-models/ggml-base.bin".into());
-    let (copy_command, paste_command, type_command) = preferred_input_commands(environment);
+    let (copy_command, paste_command) = preferred_input_commands(environment);
     let engine_command = options
         .chosen_engine
         .as_ref()
@@ -993,7 +1004,6 @@ read_clipboard_command = ["wl-paste", "--no-newline"]
 write_clipboard_command = ["wl-copy"]
 copy_command = {copy_command}
 paste_command = {paste_command}
-type_command = {type_command}
 clipboard_settle_ms = 120
 
 [overlay]
@@ -1031,7 +1041,16 @@ Transcription:
 context_awareness = true
 window_title_command = {window_title_command}
 
-{engine_comment}[engine]
+{engine_comment}# Engine fallback: repeat this section as [[engine]] tables to define a
+# chain. Each engine is tried in order; if one fails (missing binary, non-zero
+# exit, network error) the next is used. A single [engine] table also works.
+#
+#   [[engine]]
+#   argv = {engine_command}
+#   [[engine]]
+#   argv = ["ollama", "run", "llama3.2"]
+#   stdin = true
+[engine]
 argv = {engine_command}
 stdin = false
 capture_stdout = true
@@ -1058,22 +1077,24 @@ Return only the corrected text.
     )
 }
 
-fn preferred_input_commands(environment: &DetectedEnvironment) -> (String, String, String) {
+fn preferred_input_commands(environment: &DetectedEnvironment) -> (String, String) {
     if environment.wtype || !environment.ydotool {
         return (
             toml_array(&["wtype", "-M", "ctrl", "-k", "c", "-m", "ctrl"]),
             toml_array(&["wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"]),
-            toml_array(&["wtype", "{{text}}"]),
         );
     }
 
     (
         toml_array(&["ydotool", "key", "29:1", "46:1", "46:0", "29:0"]),
         toml_array(&["ydotool", "key", "29:1", "47:1", "47:0", "29:0"]),
-        toml_array(&["ydotool", "type", "--escape", "0", "{{text}}"]),
     )
 }
 
+// NOTE: the model names below (gpt-5.4-mini, gemini-3.1-flash-lite-preview,
+// gpt-4.1, claude haiku, …) are baked-in `init` defaults and date quickly. They
+// only seed a fresh config — users can edit [engine].argv afterwards — but
+// revisit them when a vendor retires or renames a model.
 fn detect_engine_choices() -> Vec<EngineChoice> {
     let mut choices = Vec::new();
 

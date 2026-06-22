@@ -23,3 +23,11 @@ serde_json = "1.0.145"
 libc = "0.2.185"
 tokio = { version = "1.52.0", features = ["macros", "rt", "net", "io-util", "process", "sync", "time", "signal"] }
 toml = { version = "0.9.8", default-features = false, features = ["parse", "serde"] }
+
+[profile.release]
+# A long-running desktop daemon: trade build time for a faster, smaller binary.
+# LTO + single codegen unit let the optimizer inline across crates; strip drops
+# debug symbols that would otherwise bloat the shipped binaries.
+lto = true
+codegen-units = 1
+strip = true

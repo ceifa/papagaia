@@ -81,4 +81,10 @@ pub enum OverlayMessage {
         ok: bool,
         message: String,
     },
+    /// A neutral, expected non-result (e.g. a tap too short to transcribe, or
+    /// audio with no speech). Rendered muted and dismissed quickly — it isn't a
+    /// failure, so it must not blare the red error styling.
+    Notice {
+        message: String,
+    },
 }

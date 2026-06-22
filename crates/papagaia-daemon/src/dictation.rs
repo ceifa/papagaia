@@ -50,13 +50,24 @@ impl Recorder {
         pcm.start().context("ALSA: failed to start capture")?;
 
         let stop = Arc::new(AtomicBool::new(false));
-        let samples: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
+        // Reserve a few seconds up front so the first handful of capture reads
+        // don't each trigger a reallocation. Capped growth (max_samples) keeps
+        // the worst case bounded; this only avoids the early churn.
+        let samples: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::with_capacity(
+            WHISPER_SAMPLE_RATE as usize * 4,
+        )));
         let max_samples = WHISPER_SAMPLE_RATE as usize * MAX_RECORDING_SECS as usize;
 
         let stop_for_thread = stop.clone();
         let samples_for_thread = samples.clone();
         let handle = thread::spawn(move || {
-            capture_loop(pcm, stop_for_thread, samples_for_thread, level_tx, max_samples);
+            capture_loop(
+                pcm,
+                stop_for_thread,
+                samples_for_thread,
+                level_tx,
+                max_samples,
+            );
         });
 
         Ok(Self {

@@ -1,10 +1,12 @@
 use std::sync::{
-    Arc, Mutex as StdMutex, RwLock,
+    Arc,
     atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Result, bail};
-use papagaia_core::{ClientRequest, ClientResponse, Config, OverlayMessage, PromptConfig};
+use papagaia_core::{
+    ClientRequest, ClientResponse, Config, OverlayMessage, PromptConfig, template_needs_selection,
+};
 use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
@@ -13,7 +15,7 @@ use tokio::{
 
 use crate::{
     cancel::CancelToken, clipboard, dictation::MAX_RECORDING_SECS, dictation::Recorder, llm,
-    overlay::OverlayHandle,
+    overlay::OverlayHandle, stream::stream_prompt_output,
 };
 
 macro_rules! log {
@@ -24,8 +26,38 @@ macro_rules! log {
     };
 }
 
+/// Recordings shorter than this are treated as accidental key taps and dropped
+/// rather than sent to whisper (which tends to hallucinate on near-silence).
+const MIN_RECORDING_SECS: f64 = 2.0;
+
+/// After releasing the overlay's exclusive keyboard grab, wait this long for
+/// the compositor to return focus to the target window before driving it with
+/// wtype/wl-paste — otherwise the paste shortcut lands on the overlay.
+const FOCUS_RETURN_SETTLE_MS: u64 = 80;
+
+/// How long the overlay lingers on a success vs. error result before hiding.
+const RESULT_FLASH_MS: u64 = 900;
+const ERROR_FLASH_MS: u64 = 3000;
+/// Expected non-results (too-short tap, no speech) dismiss quickly and quietly.
+const NOTICE_FLASH_MS: u64 = 1300;
+
+/// A non-error outcome of a dictation: the user did something expected — a tap
+/// too short to transcribe, or audio with no speech. It is surfaced as a neutral
+/// overlay notice instead of the alarming red error flash, and reported to the
+/// client as a successful (if uneventful) call.
+#[derive(Debug)]
+struct SoftOutcome(String);
+
+impl std::fmt::Display for SoftOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SoftOutcome {}
+
 pub struct App {
-    config: RwLock<Arc<Config>>,
+    config: Arc<Config>,
     overlay: OverlayHandle,
     state: Mutex<State>,
     overlay_epoch: AtomicU64,
@@ -43,13 +75,20 @@ enum State {
 
 struct RecordingSession {
     recorder: Recorder,
-    context: DictationContext,
+    /// Window-title context captured concurrently with recording. Awaited only
+    /// when recording stops, so fetching it never delays the mic from capturing
+    /// the user's first words.
+    context: JoinHandle<DictationContext>,
     overlay_epoch: u64,
     /// Forwards mic-level samples to the overlay. Aborted on every transition
     /// out of `Recording` so trailing samples (the capture thread can push one
     /// more RMS after the stop flag is set) don't land in the overlay channel
     /// after we've already sent the next state's message.
     level_forwarder: JoinHandle<()>,
+    /// Fires after `MAX_RECORDING_SECS` to auto-stop a runaway recording.
+    /// Aborted when the recording ends normally so a finished session doesn't
+    /// leave an hour-long timer parked in the runtime.
+    auto_stop: JoinHandle<()>,
 }
 
 #[derive(Default)]
@@ -76,7 +115,7 @@ impl App {
     pub async fn new(config: Config) -> Result<Self> {
         let overlay = OverlayHandle::spawn(config.overlay.enabled)?;
         Ok(Self {
-            config: RwLock::new(Arc::new(config)),
+            config: Arc::new(config),
             overlay,
             state: Mutex::new(State::Idle),
             overlay_epoch: AtomicU64::new(0),
@@ -84,7 +123,7 @@ impl App {
     }
 
     fn config(&self) -> Arc<Config> {
-        self.config.read().expect("config lock poisoned").clone()
+        self.config.clone()
     }
 
     pub async fn handle(self: &Arc<Self>, request: ClientRequest) -> Result<ClientResponse> {
@@ -244,7 +283,7 @@ impl App {
             })
             .await;
 
-        let engine = config.engine().clone();
+        let engine = config.engine.clone();
         let rendered_prompt = match &selected {
             Some(text) => prompt.render(text),
             None => prompt.template.clone(),
@@ -257,7 +296,10 @@ impl App {
         );
         log!(config, "[transform] rendered prompt: {rendered_prompt}");
         let cleaned = if prompt.stream_output {
-            stream_prompt_output(&config.tools, &engine, &rendered_prompt, cancel).await?
+            let (emitted, result) =
+                stream_prompt_output(&config.tools, &engine, &rendered_prompt, cancel).await;
+            result?;
+            emitted
         } else {
             let raw = llm::run_engine(&engine, &rendered_prompt, cancel).await?;
             log!(config, "[transform] engine output: {raw}");
@@ -271,7 +313,7 @@ impl App {
                     grab_keyboard: false,
                 })
                 .await;
-            sleep(Duration::from_millis(80)).await;
+            sleep(Duration::from_millis(FOCUS_RETURN_SETTLE_MS)).await;
 
             clipboard::paste_text(&config.tools, &cleaned, cancel).await?;
             cleaned
@@ -283,18 +325,6 @@ impl App {
     async fn dictate_start(self: &Arc<Self>) -> Result<ClientResponse> {
         let config = self.config();
 
-        // Capture context before starting recording (while the target window
-        // still has focus and the clipboard reflects the user's recent activity).
-        let context = if config.dictation.context_awareness {
-            let ctx = self.capture_dictation_context(&config).await;
-            if !ctx.window_title.is_empty() {
-                log!(config, "[dictate] context: {}", ctx.window_title);
-            }
-            ctx
-        } else {
-            DictationContext::default()
-        };
-
         let overlay_epoch;
         {
             let mut state = self.state.lock().await;
@@ -303,6 +333,10 @@ impl App {
             }
             overlay_epoch = self.next_overlay_epoch();
 
+            // Start capturing audio immediately. The mic must not wait on the
+            // compositor subprocess that fetches window-title context — that
+            // context is only consumed when recording stops, so we kick it off
+            // concurrently and await it there instead.
             let (level_tx, mut level_rx) = mpsc::unbounded_channel();
             let recorder = Recorder::start(level_tx)?;
             let overlay = self.overlay.clone();
@@ -317,28 +351,47 @@ impl App {
                 }
             });
 
+            let context = if config.dictation.context_awareness {
+                let app = self.clone();
+                let config = config.clone();
+                tokio::spawn(async move {
+                    let ctx = app.capture_dictation_context(&config).await;
+                    if !ctx.window_title.is_empty() {
+                        log!(config, "[dictate] context: {}", ctx.window_title);
+                    }
+                    ctx
+                })
+            } else {
+                tokio::spawn(async { DictationContext::default() })
+            };
+
+            // Auto-cancel recording after the maximum duration to prevent
+            // runaway memory usage and enormous WAV files. The handle is kept on
+            // the session so a normal stop aborts it instead of leaving an
+            // hour-long timer parked until it fires on a stale epoch.
+            let app = self.clone();
+            let auto_stop = tokio::spawn(async move {
+                sleep(Duration::from_secs(MAX_RECORDING_SECS)).await;
+                app.auto_stop_recording(overlay_epoch).await;
+            });
+
             *state = State::Recording(RecordingSession {
                 recorder,
                 context,
                 overlay_epoch,
                 level_forwarder,
+                auto_stop,
             });
         }
 
-        // Auto-cancel recording after the maximum duration to prevent
-        // runaway memory usage and enormous WAV files.
-        let app = self.clone();
-        tokio::spawn(async move {
-            sleep(Duration::from_secs(MAX_RECORDING_SECS)).await;
-            app.auto_stop_recording(overlay_epoch).await;
-        });
-
+        // Show the recording HUD right away so feedback is instant.
         self.overlay
             .send(OverlayMessage::Recording {
                 level: 0.0,
                 transcript: None,
             })
             .await;
+
         Ok(ClientResponse::ok("dictation started"))
     }
 
@@ -356,6 +409,7 @@ impl App {
             // Busy(Transcribing) message so trailing Recording samples can't
             // overwrite it.
             session.level_forwarder.abort();
+            session.auto_stop.abort();
             let overlay_epoch = session.overlay_epoch;
             *state = State::Busy {
                 label: "transcribing".into(),
@@ -377,20 +431,32 @@ impl App {
         let config = self.config();
         let overlay = self.overlay.clone();
         let outcome = async {
-            let (audio_path, duration_secs) = recorder.finish()?;
-            if duration_secs < 2.0 {
+            // `recorder.finish()` joins the capture thread and writes the WAV to
+            // disk — both blocking. On the current-thread runtime that would
+            // stall every other task (overlay forwarder, signals, new
+            // connections), so run it on the blocking pool instead.
+            let (audio_path, duration_secs) =
+                tokio::task::spawn_blocking(move || recorder.finish()).await??;
+            if duration_secs < MIN_RECORDING_SECS {
                 maybe_remove_audio(&config, &audio_path);
-                bail!("recording too short ({duration_secs:.1}s), ignoring");
+                return Err(
+                    SoftOutcome(format!("Too short ({duration_secs:.1}s), ignored")).into(),
+                );
             }
             let transcript = llm::run_whisper(&config.whisper, &audio_path, &cancel).await?;
             let cleaned = transcript.trim().to_string();
             log!(config, "[dictate] whisper transcript: {cleaned}");
             if cleaned.is_empty() {
-                bail!("whisper returned an empty transcript");
+                maybe_remove_audio(&config, &audio_path);
+                return Err(SoftOutcome("No speech detected".into()).into());
             }
 
             // Post-process the transcript through the LLM engine if enabled.
-            let final_text = if config.dictation.post_process {
+            // If post-processing fails we fall back to pasting the raw
+            // transcript and carry a warning message so the user is told the
+            // post-processing step errored out.
+            let (final_text, warning) = if config.dictation.post_process {
+                let context = context.await.unwrap_or_default();
                 let rendered = render_dictation_prompt(
                     &config.dictation.post_process_template,
                     &cleaned,
@@ -404,43 +470,80 @@ impl App {
                             grab_keyboard: false,
                         })
                         .await;
-                    let processed =
-                        stream_prompt_output(&config.tools, config.engine(), &rendered, &cancel)
-                            .await?;
-                    log!(config, "[dictate] post-processed (streamed): {processed}");
-                    if processed.is_empty() {
-                        overlay
-                            .send(OverlayMessage::Busy {
-                                label: "Typing".into(),
-                                grab_keyboard: false,
-                            })
+                    let (emitted, result) =
+                        stream_prompt_output(&config.tools, &config.engine, &rendered, &cancel)
                             .await;
-                        sleep(Duration::from_millis(80)).await;
-                        clipboard::paste_text(&config.tools, &cleaned, &cancel).await?;
-                        maybe_remove_audio(&config, &audio_path);
-                        return Ok(cleaned);
+                    match result {
+                        Ok(()) => {
+                            log!(config, "[dictate] post-processed (streamed): {emitted}");
+                            if !emitted.is_empty() {
+                                // Output already landed in the target window via
+                                // the streaming engine — no type phase needed.
+                                maybe_remove_audio(&config, &audio_path);
+                                return Ok((emitted, None));
+                            }
+                            // Nothing was streamed; fall through to the type
+                            // phase and paste the raw transcript.
+                            (cleaned, None)
+                        }
+                        Err(error) => {
+                            // A cancellation isn't something to recover from.
+                            if cancel.is_cancelled() {
+                                return Err(error);
+                            }
+                            // If part of the streamed output already landed in
+                            // the target window a raw paste would duplicate it,
+                            // so we can only fall back when nothing was emitted.
+                            if !emitted.is_empty() {
+                                return Err(error);
+                            }
+                            log!(
+                                config,
+                                "[dictate] post-process failed, pasting raw transcript: {error:#}"
+                            );
+                            // Fall through to the type phase to paste the raw
+                            // transcript, carrying a warning.
+                            (
+                                cleaned,
+                                Some(format!("Post-processing failed, pasted raw text: {error}")),
+                            )
+                        }
                     }
-
-                    maybe_remove_audio(&config, &audio_path);
-                    return Ok(processed);
-                }
-
-                overlay
-                    .send(OverlayMessage::Busy {
-                        label: "Processing".into(),
-                        grab_keyboard: true,
-                    })
-                    .await;
-                let raw = llm::run_engine(config.engine(), &rendered, &cancel).await?;
-                let processed = raw.trim().to_string();
-                log!(config, "[dictate] post-processed: {processed}");
-                if processed.is_empty() {
-                    cleaned
                 } else {
-                    processed
+                    overlay
+                        .send(OverlayMessage::Busy {
+                            label: "Processing".into(),
+                            grab_keyboard: true,
+                        })
+                        .await;
+                    match llm::run_engine(&config.engine, &rendered, &cancel).await {
+                        Ok(raw) => {
+                            let processed = raw.trim().to_string();
+                            log!(config, "[dictate] post-processed: {processed}");
+                            if processed.is_empty() {
+                                (cleaned, None)
+                            } else {
+                                (processed, None)
+                            }
+                        }
+                        Err(error) => {
+                            // A cancellation isn't something to recover from.
+                            if cancel.is_cancelled() {
+                                return Err(error);
+                            }
+                            log!(
+                                config,
+                                "[dictate] post-process failed, pasting raw transcript: {error:#}"
+                            );
+                            (
+                                cleaned,
+                                Some(format!("Post-processing failed, pasted raw text: {error}")),
+                            )
+                        }
+                    }
                 }
             } else {
-                cleaned
+                (cleaned, None)
             };
 
             // Type phase: release the grab so focus returns to the target
@@ -451,24 +554,38 @@ impl App {
                     grab_keyboard: false,
                 })
                 .await;
-            sleep(Duration::from_millis(80)).await;
+            sleep(Duration::from_millis(FOCUS_RETURN_SETTLE_MS)).await;
 
             clipboard::paste_text(&config.tools, &final_text, &cancel).await?;
             maybe_remove_audio(&config, &audio_path);
-            Ok::<String, anyhow::Error>(final_text)
+            Ok::<(String, Option<String>), anyhow::Error>((final_text, warning))
         }
         .await;
 
         self.leave_busy(overlay_epoch).await;
 
         match outcome {
-            Ok(text) => {
+            Ok((text, warning)) => {
                 log!(config, "[dictate] inserted: {text}");
-                self.flash_result(overlay_epoch, true, "Dictation inserted")
-                    .await;
+                match warning {
+                    Some(message) => {
+                        log!(config, "[dictate] inserted with warning: {message}");
+                        self.flash_result(overlay_epoch, false, message).await;
+                    }
+                    None => {
+                        self.flash_result(overlay_epoch, true, "Dictation inserted")
+                            .await;
+                    }
+                }
                 Ok(ClientResponse::with_text("dictation complete", text))
             }
             Err(error) => {
+                if let Some(soft) = error.downcast_ref::<SoftOutcome>() {
+                    let message = soft.0.clone();
+                    log!(config, "[dictate] {message}");
+                    self.flash_notice(overlay_epoch, message.clone()).await;
+                    return Ok(ClientResponse::ok(message));
+                }
                 log!(config, "[dictate] error: {error:#}");
                 self.finish_error(overlay_epoch, &cancel, &error).await;
                 Err(error)
@@ -486,7 +603,9 @@ impl App {
                 // current `readi` call returns. Without this abort, that
                 // trailing Recording message lands in the overlay channel
                 // after our Hidden, and the overlay sticks at "Listening…".
+                session.context.abort();
                 session.level_forwarder.abort();
+                session.auto_stop.abort();
                 drop(session.recorder);
                 drop(state);
                 self.overlay.send(OverlayMessage::Hidden).await;
@@ -524,6 +643,7 @@ impl App {
                 State::Recording(session) if session.overlay_epoch == recording_epoch => {
                     let old = std::mem::replace(&mut *state, State::Idle);
                     if let State::Recording(session) = old {
+                        session.context.abort();
                         session.level_forwarder.abort();
                         drop(session.recorder);
                     }
@@ -634,8 +754,24 @@ impl App {
                 message: message.clone(),
             })
             .await;
-        let duration = if ok { 900 } else { 3000 };
+        let duration = if ok { RESULT_FLASH_MS } else { ERROR_FLASH_MS };
         sleep(Duration::from_millis(duration)).await;
+        if self.is_current_overlay_epoch(overlay_epoch) {
+            self.overlay.send(OverlayMessage::Hidden).await;
+        }
+    }
+
+    /// Briefly show a neutral notice for an expected non-result, then hide.
+    async fn flash_notice(&self, overlay_epoch: u64, message: impl Into<String>) {
+        if !self.is_current_overlay_epoch(overlay_epoch) {
+            return;
+        }
+        self.overlay
+            .send(OverlayMessage::Notice {
+                message: message.into(),
+            })
+            .await;
+        sleep(Duration::from_millis(NOTICE_FLASH_MS)).await;
         if self.is_current_overlay_epoch(overlay_epoch) {
             self.overlay.send(OverlayMessage::Hidden).await;
         }
@@ -648,10 +784,6 @@ impl App {
     fn is_current_overlay_epoch(&self, overlay_epoch: u64) -> bool {
         self.overlay_epoch.load(Ordering::Acquire) == overlay_epoch
     }
-}
-
-fn template_needs_selection(template: &str) -> bool {
-    template.contains("{{text}}") || template.contains("{{selection}}")
 }
 
 fn render_dictation_prompt(template: &str, transcript: &str, context: &DictationContext) -> String {
@@ -668,9 +800,6 @@ fn maybe_remove_audio(config: &Config, path: &std::path::Path) {
     }
 }
 
-/// Extract a human-readable window title from the output of a compositor command.
-/// Handles JSON output from niri (`niri msg -j focused-window`) and hyprland
-/// (`hyprctl activewindow -j`), falling back to raw text.
 fn request_label(request: &ClientRequest) -> &'static str {
     match request {
         ClientRequest::Status => "status",
@@ -683,6 +812,9 @@ fn request_label(request: &ClientRequest) -> &'static str {
     }
 }
 
+/// Extract a human-readable window title from the output of a compositor command.
+/// Handles JSON output from niri (`niri msg -j focused-window`) and hyprland
+/// (`hyprctl activewindow -j`), falling back to raw text.
 fn extract_window_title(output: &str) -> String {
     let trimmed = output.trim();
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -702,225 +834,6 @@ fn extract_window_title(output: &str) -> String {
         }
     }
     trimmed.to_string()
-}
-
-async fn stream_prompt_output(
-    tools: &papagaia_core::ToolConfig,
-    engine: &papagaia_core::EngineConfig,
-    rendered_prompt: &str,
-    cancel: &CancelToken,
-) -> Result<String> {
-    let state = Arc::new(StdMutex::new(StreamOutputState::new()));
-    let tools_for_tail = tools.clone();
-    let cancel_for_tail = cancel.clone();
-    let callback_tools = tools.clone();
-    let callback_cancel = cancel.clone();
-    let callback_state = state.clone();
-
-    llm::run_engine_streaming(engine, rendered_prompt, &cancel_for_tail, move |chunk| {
-        let tools = callback_tools.clone();
-        let cancel = callback_cancel.clone();
-        let callback_state = callback_state.clone();
-        async move {
-            let flushed = {
-                let mut state = callback_state
-                    .lock()
-                    .expect("streaming output state lock poisoned");
-                state.push(&chunk)
-            };
-            if !flushed.is_empty() {
-                // Clipboard paste (not direct wtype) — wtype relies on
-                // virtual-keyboard keysyms which don't cover codepoints above
-                // the BMP, so emojis and other astral-plane chars get dropped
-                // or substituted. Clipboard paste round-trips raw UTF-8.
-                //
-                // The overlay intentionally stays visible ("Processing…")
-                // during streaming paste. Unmapping the layer surface between
-                // chunks disturbs the target window's keyboard focus on niri
-                // and swallows the Ctrl+V.
-                clipboard::paste_text(&tools, &flushed, &cancel).await?;
-                sleep(Duration::from_millis(28)).await;
-            }
-            Ok(())
-        }
-    })
-    .await?;
-
-    let (tail, emitted) = {
-        let mut state = state.lock().expect("streaming output state lock poisoned");
-        let tail = state.finish();
-        let emitted = state.emitted.clone();
-        (tail, emitted)
-    };
-
-    if !tail.is_empty() {
-        clipboard::paste_text(&tools_for_tail, &tail, &cancel_for_tail).await?;
-    }
-
-    Ok(emitted)
-}
-
-struct StreamOutputState {
-    saw_non_whitespace: bool,
-    pending_whitespace: String,
-    escape_state: EscapeState,
-    observed_sanitized: String,
-    pending_flush: String,
-    emitted: String,
-}
-
-impl StreamOutputState {
-    fn new() -> Self {
-        Self {
-            saw_non_whitespace: false,
-            pending_whitespace: String::new(),
-            escape_state: EscapeState::None,
-            observed_sanitized: String::new(),
-            pending_flush: String::new(),
-            emitted: String::new(),
-        }
-    }
-
-    fn push(&mut self, chunk: &str) -> String {
-        let sanitized = self.sanitize_chunk(chunk);
-        let raw_delta = compute_stream_delta(&self.observed_sanitized, &sanitized);
-        if raw_delta.is_empty() {
-            return String::new();
-        }
-        self.observed_sanitized.push_str(&raw_delta);
-
-        let cleaned = self.trimmed_chunk(&raw_delta);
-        if cleaned.is_empty() {
-            return String::new();
-        }
-
-        self.emitted.push_str(&cleaned);
-        self.pending_flush.push_str(&cleaned);
-        if self.should_flush() {
-            return std::mem::take(&mut self.pending_flush);
-        }
-
-        String::new()
-    }
-
-    fn finish(&mut self) -> String {
-        self.pending_whitespace.clear();
-        std::mem::take(&mut self.pending_flush)
-    }
-
-    fn trimmed_chunk(&mut self, chunk: &str) -> String {
-        let mut out = String::new();
-
-        for ch in chunk.chars() {
-            if !self.saw_non_whitespace {
-                if ch.is_whitespace() {
-                    continue;
-                }
-                self.saw_non_whitespace = true;
-            }
-
-            if ch.is_whitespace() {
-                self.pending_whitespace.push(ch);
-            } else {
-                if !self.pending_whitespace.is_empty() {
-                    out.push_str(&self.pending_whitespace);
-                    self.pending_whitespace.clear();
-                }
-                out.push(ch);
-            }
-        }
-
-        out
-    }
-
-    fn sanitize_chunk(&mut self, chunk: &str) -> String {
-        let mut out = String::new();
-
-        for ch in chunk.chars() {
-            match self.escape_state {
-                EscapeState::None => {}
-                EscapeState::Started => {
-                    self.escape_state = if ch == '[' {
-                        EscapeState::Csi
-                    } else {
-                        EscapeState::None
-                    };
-                    continue;
-                }
-                EscapeState::Csi => {
-                    if ('@'..='~').contains(&ch) {
-                        self.escape_state = EscapeState::None;
-                    }
-                    continue;
-                }
-            }
-
-            match ch {
-                '\u{1b}' => {
-                    self.escape_state = EscapeState::Started;
-                }
-                '\r' => {}
-                '\u{8}' | '\u{7f}' => {
-                    out.pop();
-                }
-                _ if ch.is_control() && ch != '\n' && ch != '\t' => {}
-                _ => out.push(ch),
-            }
-        }
-
-        out
-    }
-
-    fn should_flush(&self) -> bool {
-        self.pending_flush.contains('\n')
-            || self.pending_flush.len() >= 64
-            || (self.pending_flush.len() >= 24
-                && self
-                    .pending_flush
-                    .chars()
-                    .last()
-                    .is_some_and(|ch| ch.is_whitespace() || ",.;:!?)]}".contains(ch)))
-    }
-}
-
-#[derive(Clone, Copy)]
-enum EscapeState {
-    None,
-    Started,
-    Csi,
-}
-
-fn compute_stream_delta(emitted: &str, chunk: &str) -> String {
-    if chunk.is_empty() {
-        return String::new();
-    }
-    if emitted.is_empty() {
-        return chunk.to_string();
-    }
-    if emitted.starts_with(chunk) || emitted.ends_with(chunk) {
-        return String::new();
-    }
-    if let Some(rest) = chunk.strip_prefix(emitted) {
-        return rest.to_string();
-    }
-
-    // Find the longest suffix of `emitted` that is a prefix of `chunk`. Walk
-    // lengths from longest to shortest so we can stop at the first match.
-    // Reached only when the early-exit cases above don't fire — for typical
-    // cumulative LLM output `strip_prefix` handles it without entering here.
-    let emitted_bytes = emitted.as_bytes();
-    let chunk_bytes = chunk.as_bytes();
-    let max_overlap = emitted_bytes.len().min(chunk_bytes.len());
-
-    let mut overlap = 0;
-    for len in (1..=max_overlap).rev() {
-        if emitted_bytes.ends_with(&chunk_bytes[..len]) && chunk.is_char_boundary(len) {
-            overlap = len;
-            break;
-        }
-    }
-
-    chunk[overlap..].to_string()
 }
 
 async fn resolve_selected_text(
@@ -954,139 +867,13 @@ async fn resolve_selected_text(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        os::unix::fs::PermissionsExt,
-        path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    use papagaia_core::{EngineConfig, ToolConfig};
+    use papagaia_core::ToolConfig;
 
     use crate::cancel::CancelToken;
 
     use super::{
-        DictationContext, StreamOutputState, compute_stream_delta, extract_window_title,
-        render_dictation_prompt, resolve_selected_text, stream_prompt_output,
+        DictationContext, extract_window_title, render_dictation_prompt, resolve_selected_text,
     };
-
-    #[test]
-    fn streaming_trim_drops_outer_whitespace() {
-        let mut state = StreamOutputState::new();
-
-        assert_eq!(state.push("  hello"), "");
-        assert_eq!(state.push(" world  "), "");
-        assert_eq!(state.finish(), "hello world");
-        assert_eq!(state.emitted, "hello world");
-    }
-
-    #[test]
-    fn compute_stream_delta_handles_cumulative_chunks() {
-        assert_eq!(compute_stream_delta("h", "he"), "e");
-        assert_eq!(compute_stream_delta("hello", "hello world"), " world");
-    }
-
-    #[test]
-    fn compute_stream_delta_handles_overlapping_chunks() {
-        assert_eq!(compute_stream_delta("hello", "lo world"), " world");
-        assert_eq!(compute_stream_delta("hello world", "world"), "");
-    }
-
-    #[test]
-    fn streaming_state_strips_ansi_sequences() {
-        let mut state = StreamOutputState::new();
-        assert_eq!(state.push("\u{1b}[2Khello"), "");
-        assert_eq!(state.finish(), "hello");
-    }
-
-    #[tokio::test]
-    async fn stream_prompt_output_types_exact_delta_once() {
-        let dir = make_test_dir("stream-delta");
-        let clipboard_script = dir.join("clipboard.sh");
-        let engine_script = dir.join("engine.sh");
-        let out_path = dir.join("typed.txt");
-        fs::write(&out_path, "").expect("output file should be created");
-
-        write_executable(
-            &clipboard_script,
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-cat >> "$1"
-"#,
-        );
-        write_executable(
-            &engine_script,
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-printf '\033[2K'
-printf 'The quick '
-sleep 0.05
-printf 'The quick brown '
-sleep 0.05
-printf 'own fox'
-"#,
-        );
-
-        let tools = fake_tools(&clipboard_script, &out_path);
-        let engine = EngineConfig {
-            argv: vec![engine_script.display().to_string()],
-            stdin: false,
-            capture_stdout: true,
-        };
-
-        let emitted = stream_prompt_output(&tools, &engine, "ignored", &CancelToken::new())
-            .await
-            .expect("streaming should succeed");
-        let typed = fs::read_to_string(&out_path).expect("typed output should exist");
-
-        assert_eq!(emitted, "The quick brown fox");
-        assert_eq!(typed, "The quick brown fox");
-    }
-
-    #[tokio::test]
-    async fn stream_prompt_output_handles_backspace_and_overlap() {
-        let dir = make_test_dir("stream-backspace");
-        let clipboard_script = dir.join("clipboard.sh");
-        let engine_script = dir.join("engine.sh");
-        let out_path = dir.join("typed.txt");
-        fs::write(&out_path, "").expect("output file should be created");
-
-        write_executable(
-            &clipboard_script,
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-cat >> "$1"
-"#,
-        );
-        write_executable(
-            &engine_script,
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-printf 'hel'
-sleep 0.05
-printf 'hello '
-sleep 0.05
-printf 'o worl'
-sleep 0.05
-printf 'world!\b!'
-"#,
-        );
-
-        let tools = fake_tools(&clipboard_script, &out_path);
-        let engine = EngineConfig {
-            argv: vec![engine_script.display().to_string()],
-            stdin: false,
-            capture_stdout: true,
-        };
-
-        let emitted = stream_prompt_output(&tools, &engine, "ignored", &CancelToken::new())
-            .await
-            .expect("streaming should succeed");
-        let typed = fs::read_to_string(&out_path).expect("typed output should exist");
-
-        assert_eq!(emitted, "hello world!");
-        assert_eq!(typed, "hello world!");
-    }
 
     #[tokio::test]
     async fn raw_prompt_without_placeholder_still_attempts_optional_selection_capture() {
@@ -1097,7 +884,6 @@ printf 'world!\b!'
                 write_clipboard_command: vec!["false".into()],
                 copy_command: vec!["false".into()],
                 paste_command: vec!["false".into()],
-                type_command: vec!["false".into()],
                 clipboard_settle_ms: 0,
             },
             "say hello",
@@ -1111,40 +897,6 @@ printf 'world!\b!'
 
         assert_eq!(selected, None);
     }
-
-    fn fake_tools(clipboard_script: &Path, out_path: &Path) -> ToolConfig {
-        ToolConfig {
-            read_clipboard_command: vec!["true".into()],
-            write_clipboard_command: vec![
-                clipboard_script.display().to_string(),
-                out_path.display().to_string(),
-            ],
-            copy_command: vec!["true".into()],
-            paste_command: vec!["true".into()],
-            type_command: vec!["true".into()],
-            clipboard_settle_ms: 0,
-        }
-    }
-
-    fn make_test_dir(label: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be monotonic enough for tests")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("papagaia-{label}-{nonce}"));
-        fs::create_dir_all(&dir).expect("test dir should be created");
-        dir
-    }
-
-    fn write_executable(path: &Path, script: &str) {
-        fs::write(path, script).expect("script should be written");
-        let mut perms = fs::metadata(path)
-            .expect("script metadata should exist")
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).expect("script should be executable");
-    }
-
     #[test]
     fn extract_window_title_parses_niri_json() {
         let json = r#"{"title":"main.rs — papagaia","app_id":"org.wezfurlong.wezterm"}"#;

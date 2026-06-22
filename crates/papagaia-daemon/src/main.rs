@@ -4,6 +4,7 @@ mod clipboard;
 mod dictation;
 mod llm;
 mod overlay;
+mod stream;
 
 use std::{fs, io::ErrorKind, os::unix::fs::FileTypeExt, path::Path, sync::Arc};
 

@@ -15,7 +15,11 @@ pub struct Config {
     pub whisper: WhisperConfig,
     #[serde(default)]
     pub dictation: DictationConfig,
-    pub engine: EngineConfig,
+    /// The engine chain used for text transformation. Accepts either a single
+    /// `[engine]` table or a sequence of `[[engine]]` tables tried in order:
+    /// when one fails, the next is attempted as a fallback.
+    #[serde(deserialize_with = "deserialize_engine_chain")]
+    pub engine: Vec<EngineConfig>,
     #[serde(default)]
     pub prompts: Vec<PromptConfig>,
 }
@@ -55,12 +59,14 @@ impl Config {
         if self.tools.paste_command.is_empty() {
             bail!("tools.paste_command cannot be empty");
         }
-        if self.tools.type_command.is_empty() {
-            bail!("tools.type_command cannot be empty");
-        }
 
-        if self.engine.argv.is_empty() {
-            bail!("engine.argv cannot be empty");
+        if self.engine.is_empty() {
+            bail!("at least one [engine] must be configured");
+        }
+        for engine in &self.engine {
+            if engine.argv.is_empty() {
+                bail!("engine.argv cannot be empty");
+            }
         }
 
         for prompt in &self.prompts {
@@ -79,12 +85,26 @@ impl Config {
             .with_context(|| format!("unknown prompt '{name}'"))
     }
 
-    pub fn engine(&self) -> &EngineConfig {
-        &self.engine
-    }
-
     fn normalize(&mut self) {
         self.whisper.model = expand_home(&self.whisper.model);
+        let argv_fields = [
+            &mut self.tools.read_clipboard_command,
+            &mut self.tools.write_clipboard_command,
+            &mut self.tools.copy_command,
+            &mut self.tools.paste_command,
+            &mut self.whisper.argv,
+            &mut self.dictation.window_title_command,
+        ];
+        for argv in argv_fields {
+            for arg in argv.iter_mut() {
+                *arg = expand_home(arg);
+            }
+        }
+        for engine in &mut self.engine {
+            for arg in engine.argv.iter_mut() {
+                *arg = expand_home(arg);
+            }
+        }
     }
 }
 
@@ -98,8 +118,6 @@ pub struct ToolConfig {
     pub copy_command: Vec<String>,
     #[serde(default = "default_paste_command")]
     pub paste_command: Vec<String>,
-    #[serde(default = "default_type_command")]
-    pub type_command: Vec<String>,
     #[serde(default = "default_clipboard_settle_ms")]
     pub clipboard_settle_ms: u64,
 }
@@ -111,7 +129,6 @@ impl Default for ToolConfig {
             write_clipboard_command: default_write_clipboard_command(),
             copy_command: default_copy_command(),
             paste_command: default_paste_command(),
-            type_command: default_type_command(),
             clipboard_settle_ms: default_clipboard_settle_ms(),
         }
     }
@@ -200,6 +217,26 @@ pub struct EngineConfig {
     pub capture_stdout: bool,
 }
 
+/// Deserialize the `engine` field from either a single `[engine]` table or a
+/// sequence of `[[engine]]` tables. A single table becomes a one-element chain,
+/// preserving backward compatibility with configs that predate engine fallback.
+fn deserialize_engine_chain<'de, D>(deserializer: D) -> Result<Vec<EngineConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(EngineConfig),
+        Many(Vec<EngineConfig>),
+    }
+
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(engine) => vec![engine],
+        OneOrMany::Many(engines) => engines,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptConfig {
     pub name: String,
@@ -218,8 +255,15 @@ impl PromptConfig {
     }
 }
 
+/// Whether a prompt template references the captured selection via a
+/// `{{text}}` or `{{selection}}` placeholder. When false, callers append the
+/// selection (if any) to the end of the template instead.
+pub fn template_needs_selection(template: &str) -> bool {
+    template.contains("{{text}}") || template.contains("{{selection}}")
+}
+
 pub fn render_prompt_template(template: &str, selected_text: &str) -> String {
-    if template.contains("{{text}}") || template.contains("{{selection}}") {
+    if template_needs_selection(template) {
         return template
             .replace("{{text}}", selected_text)
             .replace("{{selection}}", selected_text);
@@ -342,10 +386,6 @@ fn default_paste_command() -> Vec<String> {
     wtype_paste_command()
 }
 
-fn default_type_command() -> Vec<String> {
-    wtype_type_command()
-}
-
 fn default_whisper_model() -> String {
     "~/.local/share/whisper.cpp/ggml-base.bin".into()
 }
@@ -394,10 +434,6 @@ fn wtype_paste_command() -> Vec<String> {
     ]
 }
 
-fn wtype_type_command() -> Vec<String> {
-    vec!["wtype".into(), "{{text}}".into()]
-}
-
 #[cfg(test)]
 mod tests {
     use super::{PromptConfig, expand_home, render_prompt_template, strip_outer_markdown_fence};
@@ -430,5 +466,43 @@ mod tests {
     #[test]
     fn expand_home_keeps_non_home_paths() {
         assert_eq!(expand_home("/tmp/model.bin"), "/tmp/model.bin");
+    }
+
+    #[test]
+    fn single_engine_table_parses_as_one_element_chain() {
+        let config: super::Config = toml::from_str(
+            r#"
+[engine]
+argv = ["codex", "{{prompt}}"]
+"#,
+        )
+        .expect("single [engine] table should parse");
+
+        assert_eq!(config.engine.len(), 1);
+        assert_eq!(config.engine[0].argv, vec!["codex", "{{prompt}}"]);
+        config.validate().expect("single engine is valid");
+    }
+
+    #[test]
+    fn repeated_engine_tables_parse_as_ordered_chain() {
+        let config: super::Config = toml::from_str(
+            r#"
+[[engine]]
+argv = ["codex", "{{prompt}}"]
+stdin = false
+
+[[engine]]
+argv = ["ollama", "run", "llama3.2"]
+stdin = true
+"#,
+        )
+        .expect("repeated [[engine]] tables should parse");
+
+        assert_eq!(config.engine.len(), 2);
+        assert_eq!(config.engine[0].argv[0], "codex");
+        assert!(!config.engine[0].stdin);
+        assert_eq!(config.engine[1].argv[0], "ollama");
+        assert!(config.engine[1].stdin);
+        config.validate().expect("engine chain is valid");
     }
 }

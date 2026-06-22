@@ -66,7 +66,7 @@ Config lives at `~/.config/papagaia/config.toml` (run `papagaia config-path` to 
 
 | Section | Purpose |
 |---|---|
-| `[tools]` | Clipboard read/write, copy/paste simulation, text typing commands |
+| `[tools]` | Clipboard read/write and copy/paste key-injection commands |
 | `[whisper]` | Speech-to-text command and model path |
 | `[dictation]` | Post-processing, streaming, context capture, audio debug |
 | `[engine]` | LLM CLI for text transformation |
@@ -74,4 +74,9 @@ Config lives at `~/.config/papagaia/config.toml` (run `papagaia config-path` to 
 
 ## Troubleshooting
 
-Run `papagaia doctor` to diagnose issues. Common fixes:
+Run `papagaia doctor` to diagnose issues. It reports which required and optional
+commands, models, and services are present, with a suggested fix for each one
+that's missing.
+
+Set `logging = true` in the config to get verbose daemon logs (visible via
+`journalctl --user -u papagaia-daemon -f` when running under systemd).

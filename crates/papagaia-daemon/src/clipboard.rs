@@ -32,6 +32,12 @@ pub async fn capture_selection(tools: &ToolConfig, cancel: &CancelToken) -> Resu
         restore_clipboard_text(tools, before.as_deref(), cancel).await;
         bail!("no text was selected");
     }
+    // Put back whatever the user had on the clipboard before we hijacked it for
+    // the copy probe. On the happy path `paste_text` overwrites it again with
+    // the result, but if the operation errors or is cancelled before the paste
+    // (e.g. the engine fails), this leaves the user's original clipboard intact
+    // instead of stranding the captured selection there.
+    restore_clipboard_text(tools, before.as_deref(), cancel).await;
     Ok(text)
 }
 
@@ -65,39 +71,18 @@ pub async fn run_command(
     command.stderr(std::process::Stdio::piped());
     command.kill_on_drop(true);
 
-    let mut child = command
+    let child = command
         .spawn()
         .with_context(|| format!("failed to spawn {}", argv.join(" ")))?;
 
-    if let Some(text) = stdin_text
-        && let Some(mut stdin) = child.stdin.take()
-    {
-        use tokio::io::AsyncWriteExt;
-        stdin.write_all(text.as_bytes()).await?;
-    }
+    let output = run_child_collecting(child, stdin_text, cancel, argv).await?;
 
-    // Do not use wait_with_output() — commands like wl-copy fork a background
-    // process that inherits our piped stdout/stderr. wait_with_output waits for
-    // pipe EOF which never arrives while the fork lives, hanging the daemon.
-    // Instead: wait for the child to exit, then drain whatever the pipes hold.
-    let mut child_stdout = child.stdout.take();
-    let mut child_stderr = child.stderr.take();
-
-    let status = wait_or_cancel(&mut child, cancel, argv).await?;
-
-    let stdout = drain_pipe(&mut child_stdout).await;
-    let stderr = drain_pipe(&mut child_stderr).await;
-
-    if !status.success() {
-        let stderr_text = String::from_utf8_lossy(&stderr);
+    if !output.status.success() {
+        let stderr_text = String::from_utf8_lossy(&output.stderr);
         bail!("{}", command_failure(argv, stderr_text.trim()));
     }
 
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
+    Ok(output)
 }
 
 /// Like [`run_command`] but tolerates specific non-zero exit codes, returning
@@ -121,29 +106,19 @@ pub async fn run_command_allow_exit(
     command.stderr(std::process::Stdio::piped());
     command.kill_on_drop(true);
 
-    let mut child = command
+    let child = command
         .spawn()
         .with_context(|| format!("failed to spawn {}", argv.join(" ")))?;
 
-    let mut child_stdout = child.stdout.take();
-    let mut child_stderr = child.stderr.take();
+    let output = run_child_collecting(child, None, cancel, argv).await?;
 
-    let status = wait_or_cancel(&mut child, cancel, argv).await?;
-
-    let stdout = drain_pipe(&mut child_stdout).await;
-    let stderr = drain_pipe(&mut child_stderr).await;
-
-    let code = status.code().unwrap_or(-1);
-    if !status.success() && !allowed_codes.contains(&code) {
-        let stderr_text = String::from_utf8_lossy(&stderr);
+    let code = output.status.code().unwrap_or(-1);
+    if !output.status.success() && !allowed_codes.contains(&code) {
+        let stderr_text = String::from_utf8_lossy(&output.stderr);
         bail!("{}", command_failure(argv, stderr_text.trim()));
     }
 
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
+    Ok(output)
 }
 
 pub async fn run_command_streaming<F, Fut>(
@@ -151,7 +126,7 @@ pub async fn run_command_streaming<F, Fut>(
     stdin_text: Option<&str>,
     cancel: &CancelToken,
     mut on_stdout: F,
-) -> Result<std::process::Output>
+) -> Result<std::process::ExitStatus>
 where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<()>>,
@@ -187,7 +162,11 @@ where
 
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
-    let mut stdout_bytes = Vec::new();
+    // The streaming path hands every byte to `on_stdout` as it arrives; the
+    // caller consumes the output through that callback, not the return value.
+    // So we deliberately don't accumulate the full stdout here — doing so would
+    // build a second full-size copy of a potentially large engine response only
+    // to discard it. `pending_utf8` holds just the unflushed tail.
     let mut pending_utf8 = Vec::new();
 
     // Spawn a background waiter for the child PID so we can detect exit
@@ -223,7 +202,6 @@ where
 
         match bytes {
             Some(bytes) => {
-                stdout_bytes.extend_from_slice(&bytes);
                 pending_utf8.extend_from_slice(&bytes);
                 flush_valid_utf8(&mut pending_utf8, &mut on_stdout).await?;
             }
@@ -247,13 +225,7 @@ where
         }
     }
 
-    drain_streaming_stdout(
-        &mut stdout,
-        &mut stdout_bytes,
-        &mut pending_utf8,
-        &mut on_stdout,
-    )
-    .await?;
+    drain_streaming_stdout(&mut stdout, &mut pending_utf8, &mut on_stdout).await?;
 
     if !pending_utf8.is_empty() {
         bail!("command produced invalid UTF-8 on stdout");
@@ -267,11 +239,7 @@ where
         bail!("{}", command_failure(argv, stderr_text.trim()));
     }
 
-    Ok(std::process::Output {
-        status,
-        stdout: stdout_bytes,
-        stderr,
-    })
+    Ok(status)
 }
 
 async fn read_clipboard_text(tools: &ToolConfig, cancel: &CancelToken) -> Result<String> {
@@ -356,66 +324,128 @@ async fn spawn_waitpid(pid: u32) -> std::io::Result<std::process::ExitStatus> {
     .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
-/// Wait for the child to exit, killing it if the cancel token fires.
+/// Spawn `argv`, optionally feed `stdin_text`, and collect stdout/stderr while
+/// concurrently waiting for the child to exit.
 ///
-/// Spawns a background task to await the child exit, then `select!`s between
-/// the result and the cancel token. This avoids the borrow-checker issue with
-/// `child.wait()` inside `select!` and eliminates polling latency.
-async fn wait_or_cancel(
-    child: &mut Child,
+/// Reading the pipes concurrently with the exit wait is what prevents a
+/// deadlock when the child emits more output than the OS pipe buffer holds
+/// (~64 KiB): without it, the child blocks on a full stdout pipe while we block
+/// waiting for it to exit. This matters for long whisper transcripts and large
+/// engine responses. The stdin write also runs in its own task so a child that
+/// interleaves reading stdin with writing stdout can't wedge us against a full
+/// pipe either.
+///
+/// We deliberately avoid `wait_with_output()`: commands like `wl-copy` fork a
+/// background daemon that inherits our piped stdout/stderr, so the pipe never
+/// reaches EOF while that fork lives. Instead we stop reading once the child
+/// itself exits and give the buffered bytes a short, bounded drain.
+async fn run_child_collecting(
+    mut child: Child,
+    stdin_text: Option<&str>,
     cancel: &CancelToken,
     argv: &[String],
-) -> Result<std::process::ExitStatus> {
-    let id = child.id();
-    let (tx, mut rx) = tokio::sync::oneshot::channel();
-    let wait_argv = argv.join(" ");
-    // Wait via a raw waitpid so `child` remains accessible for kill.
-    tokio::spawn(async move {
-        let status = match id {
-            Some(pid) => spawn_waitpid(pid).await,
-            None => Err(std::io::Error::other("child has no PID")),
-        };
-        let _ = tx.send(status);
-    });
+) -> Result<std::process::Output> {
+    if let Some(text) = stdin_text
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        let text = text.to_string();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(text.as_bytes()).await;
+            // Dropping `stdin` here closes the pipe so the child sees EOF.
+        });
+    }
 
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            let _ = child.start_kill();
-            // Still collect the exit status so the child doesn't become a zombie.
-            let _ = rx.await;
-            bail!("operation cancelled");
-        }
-        result = &mut rx => {
-            match result {
-                Ok(Ok(status)) => Ok(status),
-                Ok(Err(error)) => Err(error)
-                    .with_context(|| format!("failed to wait for {}", argv.join(" "))),
-                Err(_) => bail!("child wait task was dropped for {}", wait_argv),
+    let mut child_stdout = child.stdout.take();
+    let mut child_stderr = child.stderr.take();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+    let wait_argv = argv.join(" ");
+    if let Some(pid) = child.id() {
+        tokio::spawn(async move {
+            let _ = exit_tx.send(spawn_waitpid(pid).await);
+        });
+    }
+
+    let status = loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                let _ = child.start_kill();
+                // Still reap the child so it doesn't become a zombie.
+                let _ = exit_rx.await;
+                bail!("operation cancelled");
             }
+            result = &mut exit_rx => {
+                match result {
+                    Ok(Ok(status)) => break status,
+                    Ok(Err(error)) => return Err(error)
+                        .with_context(|| format!("failed to wait for {wait_argv}")),
+                    Err(_) => bail!("child wait task was dropped for {wait_argv}"),
+                }
+            }
+            result = read_pipe_into(&mut child_stdout, &mut stdout) => result?,
+            result = read_pipe_into(&mut child_stderr, &mut stderr) => result?,
         }
+    };
+
+    // The child has exited; drain whatever is still buffered, bounded by a
+    // short timeout (see the wl-copy note above).
+    append_drained(&mut child_stdout, &mut stdout).await;
+    append_drained(&mut child_stderr, &mut stderr).await;
+
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Read one chunk from an optional pipe directly into `out`, growing it in
+/// place (no per-chunk allocation). Clears the pipe on EOF; a `None` pipe never
+/// resolves, so its `select!` branch goes quiet once the pipe has closed.
+async fn read_pipe_into<R: AsyncRead + Unpin>(
+    pipe: &mut Option<R>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    match pipe.as_mut() {
+        Some(reader) => {
+            let read = reader
+                .read_buf(out)
+                .await
+                .context("failed to read command output")?;
+            if read == 0 {
+                *pipe = None;
+            }
+            Ok(())
+        }
+        None => std::future::pending().await,
     }
 }
 
-/// Read whatever a pipe holds after the child has exited.
+/// Append whatever a pipe still holds after the child has exited, bounded by a
+/// short timeout so a lingering `wl-copy` fork can't hang the read forever.
 ///
 /// For well-behaved commands the pipe closes with the child and this returns
-/// instantly. For commands that fork a background process (e.g. `wl-copy`)
-/// the forked child keeps the pipe open — we give it a short grace window and
-/// then return whatever was already buffered.
+/// instantly. `wl-copy` forks a background daemon that inherits the pipe and
+/// never writes or closes it, so the read would otherwise block forever.
+async fn append_drained<R: AsyncRead + Unpin>(pipe: &mut Option<R>, out: &mut Vec<u8>) {
+    if let Some(reader) = pipe.as_mut() {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::io::AsyncReadExt::read_to_end(reader, out),
+        )
+        .await;
+    }
+}
+
+/// Like [`append_drained`] but returns a fresh buffer. Used by the streaming
+/// path, which collects stderr separately from the bytes it streams out.
 async fn drain_pipe<R: AsyncRead + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
-    let Some(pipe) = pipe.as_mut() else {
-        return Vec::new();
-    };
     let mut buf = Vec::new();
-    // Cap the whole drain — not just subsequent reads. wl-copy's forked
-    // background daemon inherits stderr and never writes or closes it, so
-    // the first read blocks forever without a timeout around it.
-    let _ = tokio::time::timeout(
-        Duration::from_millis(100),
-        tokio::io::AsyncReadExt::read_to_end(pipe, &mut buf),
-    )
-    .await;
+    append_drained(pipe, &mut buf).await;
     buf
 }
 
@@ -444,7 +474,6 @@ async fn read_stdout_bytes(
 
 async fn drain_streaming_stdout<F, Fut>(
     stdout: &mut Option<tokio::process::ChildStdout>,
-    stdout_bytes: &mut Vec<u8>,
     pending_utf8: &mut Vec<u8>,
     on_stdout: &mut F,
 ) -> Result<()>
@@ -455,7 +484,6 @@ where
     while stdout.is_some() {
         match tokio::time::timeout(Duration::from_millis(200), read_stdout_bytes(stdout)).await {
             Ok(Ok(Some(bytes))) => {
-                stdout_bytes.extend_from_slice(&bytes);
                 pending_utf8.extend_from_slice(&bytes);
                 flush_valid_utf8(pending_utf8, on_stdout).await?;
             }
@@ -733,7 +761,6 @@ esac
                 selection_path.display().to_string(),
             ],
             paste_command: vec!["true".into()],
-            type_command: vec!["true".into()],
             clipboard_settle_ms: 0,
         }
     }

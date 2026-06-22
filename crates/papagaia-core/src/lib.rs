@@ -3,7 +3,7 @@ pub mod ipc;
 
 pub use config::{
     Config, DictationConfig, EngineConfig, OverlayConfig, PromptConfig, ToolConfig, WhisperConfig,
-    config_path, expand_home, overlay_program, runtime_dir, socket_path,
+    config_path, expand_home, overlay_program, runtime_dir, socket_path, template_needs_selection,
 };
 pub use ipc::{ClientRequest, ClientResponse, OverlayMessage};
 
