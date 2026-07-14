@@ -9,7 +9,23 @@ A lightweight voice-writing and text-rewriting tool for Linux Wayland desktops, 
 - **Own hotkeys**: global keys watched via evdev — no compositor keybindings to set up
 - **BYO tooling**: plug in your own speech-to-text CLI, LLM CLI, clipboard tools, and typing backend
 
-## Quick Start
+## Install
+
+On Arch Linux, install from the [AUR](https://aur.archlinux.org/packages/papagaia):
+
+```bash
+paru -S papagaia   # or: yay -S papagaia
+```
+
+Then set it up:
+
+```bash
+papagaia init      # generates config, installs systemd service
+papagaia doctor    # checks your environment
+papagaia status    # confirms daemon is running
+```
+
+## Build from source
 
 ```bash
 cargo build --release
