@@ -541,7 +541,13 @@ fn build_wave() -> Wave {
     let bars_for_draw = bars.clone();
     let kind_for_draw = kind.clone();
     area.set_draw_func(move |_, cr, width, height| {
-        draw_wave(cr, width, height, &bars_for_draw.borrow(), kind_for_draw.get());
+        draw_wave(
+            cr,
+            width,
+            height,
+            &bars_for_draw.borrow(),
+            kind_for_draw.get(),
+        );
     });
 
     Wave {

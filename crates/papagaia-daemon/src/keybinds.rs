@@ -95,7 +95,10 @@ fn watch_loop(
                     "papagaia: keybinds found no readable keyboards (is your user in the 'input' group?)"
                 );
             } else {
-                eprintln!("papagaia: keybinds watching {} keyboard device(s)", watched.len());
+                eprintln!(
+                    "papagaia: keybinds watching {} keyboard device(s)",
+                    watched.len()
+                );
             }
             first_pass = false;
         }

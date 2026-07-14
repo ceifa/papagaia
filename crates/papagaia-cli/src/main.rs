@@ -273,7 +273,10 @@ fn print_detection_summary(env: &DetectedEnvironment) {
     if let Some(model) = &env.whisper_model {
         println!("  whisper model: {}", model.display());
     }
-    println!("  keybinds:      input readable={}", yes_no(env.input_readable));
+    println!(
+        "  keybinds:      input readable={}",
+        yes_no(env.input_readable)
+    );
     println!(
         "  compositor:    {}",
         if env.niri {
@@ -415,7 +418,10 @@ fn run_doctor() -> Result<()> {
         ),
     });
 
-    if matches!(config.whisper.backend, papagaia_core::WhisperBackend::Server) {
+    if matches!(
+        config.whisper.backend,
+        papagaia_core::WhisperBackend::Server
+    ) {
         checks.push(DoctorCheck {
             level: CheckLevel::Optional,
             ok: environment.whisper_server,
@@ -523,7 +529,13 @@ fn run_doctor() -> Result<()> {
             papagaia_core::WhisperBackend::Cli => "cli",
         }
     );
-    let keybind = |key: &str| if key.is_empty() { "—".to_string() } else { key.to_string() };
+    let keybind = |key: &str| {
+        if key.is_empty() {
+            "—".to_string()
+        } else {
+            key.to_string()
+        }
+    };
     println!(
         "- keybinds: push_to_talk={}, toggle={}, pick={} (input readable={})",
         keybind(&config.keybinds.push_to_talk),
@@ -689,7 +701,11 @@ fn render_init_config(environment: &DetectedEnvironment, options: &InitOptions) 
     let whisper_backend = if options.use_server { "server" } else { "cli" };
     // Default the push-to-talk hotkey on only when evdev can actually read the
     // keyboard; otherwise leave it empty so nothing silently fails.
-    let push_to_talk_key = if options.push_to_talk { "RightCtrl" } else { "" };
+    let push_to_talk_key = if options.push_to_talk {
+        "RightCtrl"
+    } else {
+        ""
+    };
 
     format!(
         r#"logging = true
@@ -1204,6 +1220,12 @@ mod tests {
         assert_eq!(parsed.keybinds.push_to_talk, "RightCtrl");
         assert!(parsed.dictation.cleanup.voice_commands);
         assert!(!parsed.dictation.cleanup.remove_fillers);
-        assert!(parsed.whisper.server_argv.iter().any(|a| a == "whisper-server"));
+        assert!(
+            parsed
+                .whisper
+                .server_argv
+                .iter()
+                .any(|a| a == "whisper-server")
+        );
     }
 }

@@ -538,7 +538,8 @@ fn default_whisper_model() -> String {
 }
 
 fn default_whisper_prompt() -> String {
-    "Natural spoken dictation with correct punctuation, natural sentences, and no filler words.".into()
+    "Natural spoken dictation with correct punctuation, natural sentences, and no filler words."
+        .into()
 }
 
 fn default_whisper_argv() -> Vec<String> {
@@ -596,7 +597,10 @@ mod tests {
     fn whisper_prompt_is_shared_by_both_backends_via_placeholder() {
         let whisper = WhisperConfig::default();
         assert!(!whisper.prompt.is_empty());
-        for (name, argv) in [("argv", &whisper.argv), ("server_argv", &whisper.server_argv)] {
+        for (name, argv) in [
+            ("argv", &whisper.argv),
+            ("server_argv", &whisper.server_argv),
+        ] {
             assert!(
                 argv.iter().any(|arg| arg == "{{prompt}}"),
                 "{name} should reference the prompt placeholder"

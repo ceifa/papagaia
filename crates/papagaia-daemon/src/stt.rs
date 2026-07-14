@@ -137,7 +137,9 @@ impl Endpoint {
         let authority = rest.split('/').next().unwrap_or(rest);
         let addr = authority
             .to_socket_addrs()
-            .with_context(|| format!("could not resolve whisper.server_url authority '{authority}'"))?
+            .with_context(|| {
+                format!("could not resolve whisper.server_url authority '{authority}'")
+            })?
             .next()
             .with_context(|| format!("no address resolved for '{authority}'"))?;
         Ok(Self {
@@ -262,7 +264,8 @@ fn build_multipart_body(boundary: &str, wav: &[u8]) -> Vec<u8> {
 /// Split an HTTP/1.1 response, require a 2xx status, and extract `text` from the
 /// JSON body. Any deviation is an error so the caller falls back to the CLI.
 fn parse_http_response(raw: &[u8]) -> Result<String> {
-    let split = find_subsequence(raw, b"\r\n\r\n").context("malformed HTTP response (no header/body split)")?;
+    let split = find_subsequence(raw, b"\r\n\r\n")
+        .context("malformed HTTP response (no header/body split)")?;
     let header = String::from_utf8_lossy(&raw[..split]);
     let body = &raw[split + 4..];
 
@@ -277,8 +280,8 @@ fn parse_http_response(raw: &[u8]) -> Result<String> {
     }
 
     let body_text = String::from_utf8_lossy(body);
-    let parsed: serde_json::Value =
-        serde_json::from_str(body_text.trim()).context("whisper-server returned a non-JSON body")?;
+    let parsed: serde_json::Value = serde_json::from_str(body_text.trim())
+        .context("whisper-server returned a non-JSON body")?;
     let text = parsed
         .get("text")
         .and_then(|value| value.as_str())

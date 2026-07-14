@@ -65,7 +65,9 @@ fn command_for(key: &str) -> Option<Piece> {
         "period" | "full stop" | "ponto final" => Piece::Punct("."),
         "comma" | "vírgula" | "virgula" => Piece::Punct(","),
         "question mark" | "ponto de interrogação" | "ponto de interrogacao" => Piece::Punct("?"),
-        "exclamation mark" | "exclamation point" | "ponto de exclamação"
+        "exclamation mark"
+        | "exclamation point"
+        | "ponto de exclamação"
         | "ponto de exclamacao" => Piece::Punct("!"),
         "colon" | "dois pontos" => Piece::Punct(":"),
         "semicolon" | "ponto e vírgula" | "ponto e virgula" => Piece::Punct(";"),
@@ -161,9 +163,7 @@ fn dedupe_immediate_repeats(line: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
     for word in line.split_whitespace() {
         let key = word_key(word);
-        if !key.is_empty()
-            && out.last().is_some_and(|prev| word_key(prev) == key)
-        {
+        if !key.is_empty() && out.last().is_some_and(|prev| word_key(prev) == key) {
             continue;
         }
         out.push(word);
