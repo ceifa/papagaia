@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    f64::consts::{FRAC_PI_2, PI},
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
     rc::Rc,
@@ -7,40 +8,18 @@ use std::{
 };
 
 use anyhow::Result;
-use clap::Parser;
+use futures_util::StreamExt;
 use glib::{self, ControlFlow};
 use gtk::prelude::*;
 use gtk4 as gtk;
 use gtk4_layer_shell::{self as layer_shell, LayerShell};
-use papagaia_core::{ClientRequest, OverlayMessage};
-use serde::{Deserialize, Serialize};
+use papagaia_core::{ClientRequest, OverlayMessage, PickerEntry, PickerResult};
 
-#[derive(Parser)]
-#[command(name = "papagaia-overlay")]
-struct Args {
-    #[arg(long)]
-    pick: bool,
-}
-
-#[derive(Clone, Deserialize)]
-struct PickerEntry {
-    name: String,
-    summary: String,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-enum PickerResult {
-    Template {
-        name: String,
-    },
-    Raw {
-        template: String,
-        stream_output: bool,
-    },
-}
-
-const BRAILLE_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Number of bars in the waveform and the drawing-area dimensions of the pill's
+/// voice meter. Kept compact so the pill stays small, like Wispr Flow.
+const BAR_COUNT: usize = 26;
+const WAVE_W: i32 = 150;
+const WAVE_H: i32 = 20;
 
 const STATE_CLASSES: &[&str] = &[
     "state-idle",
@@ -52,15 +31,12 @@ const STATE_CLASSES: &[&str] = &[
 ];
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let pick = std::env::args().skip(1).any(|arg| arg == "--pick");
 
-    // NON_UNIQUE on both: without it, GTK registers the application_id as a
-    // D-Bus name. A second instance (e.g. after the daemon restarts while an
-    // orphan overlay is still alive) would then silently act as a remote
-    // client — it activates the orphan and exits without creating its own
-    // window, so the new daemon's messages go nowhere. NON_UNIQUE makes each
-    // spawn own its own windows.
-    let app = if args.pick {
+    // NON_UNIQUE: otherwise a second instance (e.g. after a daemon restart while
+    // an orphan overlay lives) would act as a remote client to the orphan and
+    // never create its own window. This makes each spawn own its windows.
+    let app = if pick {
         gtk::Application::builder()
             .application_id("io.ceifa.papagaia.picker")
             .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
@@ -72,7 +48,7 @@ fn main() -> Result<()> {
             .build()
     };
 
-    if args.pick {
+    if pick {
         let entries = read_picker_entries();
         app.connect_activate(move |app| build_picker_ui(app, entries.clone()));
     } else {
@@ -356,12 +332,11 @@ fn parse_picker_raw(text: &str) -> Option<PickerResult> {
 
     Some(PickerResult::Raw {
         template: text.to_string(),
-        stream_output: true,
     })
 }
 
 // ---------------------------------------------------------------------------
-// HUD mode (existing overlay)
+// HUD mode — Wispr-style bottom-center pill
 // ---------------------------------------------------------------------------
 
 fn build_ui(app: &gtk::Application) {
@@ -375,8 +350,10 @@ fn build_ui(app: &gtk::Application) {
     window.init_layer_shell();
     window.set_layer(layer_shell::Layer::Overlay);
     window.set_keyboard_mode(layer_shell::KeyboardMode::None);
-    window.set_anchor(layer_shell::Edge::Top, true);
-    window.set_margin(layer_shell::Edge::Top, 36);
+    // Bottom-center, like Wispr Flow. Anchoring only to the bottom edge (no
+    // left/right) lets layer-shell center the pill horizontally.
+    window.set_anchor(layer_shell::Edge::Bottom, true);
+    window.set_margin(layer_shell::Edge::Bottom, 48);
 
     let key_ctrl = gtk::EventControllerKey::new();
     key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -393,29 +370,30 @@ fn build_ui(app: &gtk::Application) {
 
     let card = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(10)
+        .spacing(9)
         .valign(gtk::Align::Center)
         .build();
     card.add_css_class("papagaia-card");
 
     let glyph = gtk::Label::new(None);
     glyph.add_css_class("glyph");
-    glyph.set_use_markup(true);
     glyph.set_xalign(0.5);
-    glyph.set_width_chars(2);
+    glyph.set_visible(false);
 
-    let bars = build_bars();
+    let wave = build_wave();
+
     let message = gtk::Label::builder()
         .label("")
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
-        .max_width_chars(28)
+        .max_width_chars(30)
         .xalign(0.0)
         .build();
     message.add_css_class("message");
+    message.set_visible(false);
 
     card.append(&glyph);
-    card.append(&bars.container);
+    card.append(&wave.area);
     card.append(&message);
 
     window.set_child(Some(&card));
@@ -428,24 +406,18 @@ fn build_ui(app: &gtk::Application) {
         card: card.clone(),
         glyph,
         message,
-        bars,
-        spinner_frame: Cell::new(0),
+        wave,
         opacity: Cell::new(0.0),
         target_opacity: Cell::new(0.0),
         pending_hide: Cell::new(false),
         shown: Cell::new(false),
         render_source: RefCell::new(None),
-        spinner_source: RefCell::new(None),
     });
 
-    // Deliver overlay messages event-driven rather than polling. A blocking
-    // stdin reader thread forwards parsed messages over an async channel; the
-    // local future below wakes only when one arrives. The HUD is hidden the vast
-    // majority of the time, so the previous always-on 33ms poll (plus the 90ms
-    // spinner timer) burned ~40 wakeups/second forever for nothing. Now an idle
-    // overlay schedules no timers at all — the animation ticks are armed only
-    // while there is something to animate (see `ensure_render_tick`).
-    let (tx, rx) = async_channel::unbounded::<OverlayMessage>();
+    // A blocking stdin reader forwards parsed messages over a channel; the local
+    // future below wakes only on a message (no polling). Animation ticks are armed
+    // only while there's something to animate (see `ensure_render_tick`).
+    let (tx, mut rx) = futures_channel::mpsc::unbounded::<OverlayMessage>();
     thread::spawn(move || {
         let stdin = io::stdin();
         let mut locked = stdin.lock();
@@ -456,7 +428,7 @@ fn build_ui(app: &gtk::Application) {
                 Ok(0) => break,
                 Ok(_) => {
                     if let Ok(message) = serde_json::from_str::<OverlayMessage>(&line)
-                        && tx.send_blocking(message).is_err()
+                        && tx.unbounded_send(message).is_err()
                     {
                         break;
                     }
@@ -468,7 +440,7 @@ fn build_ui(app: &gtk::Application) {
 
     let apply_state = Rc::clone(&state);
     glib::spawn_future_local(async move {
-        while let Ok(message) = rx.recv().await {
+        while let Some(message) = rx.next().await {
             apply_message(&apply_state, message);
             // Any message either starts a fade-in, a fade-out, or live bars, so
             // make sure the animation tick is running to carry it to rest.
@@ -478,8 +450,8 @@ fn build_ui(app: &gtk::Application) {
 }
 
 /// Arms the ~33ms animation tick if it isn't already running. The tick advances
-/// the fade and the recording bars, then suspends itself once everything has
-/// settled, so an idle/hidden overlay holds no timer.
+/// the fade and the waveform, then suspends itself once everything has settled,
+/// so an idle/hidden overlay holds no timer.
 fn ensure_render_tick(state: &Rc<UiState>) {
     if state.render_source.borrow().is_some() {
         return;
@@ -487,8 +459,8 @@ fn ensure_render_tick(state: &Rc<UiState>) {
     let tick_state = Rc::clone(state);
     let id = glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
         step_opacity(&tick_state);
-        if tick_state.shown.get() && tick_state.card.has_css_class("state-recording") {
-            step_bars(&tick_state.bars);
+        if tick_state.shown.get() && wave_active(&tick_state) {
+            step_wave(&tick_state.wave);
         }
         if is_animating(&tick_state) {
             ControlFlow::Continue
@@ -500,34 +472,17 @@ fn ensure_render_tick(state: &Rc<UiState>) {
     *state.render_source.borrow_mut() = Some(id);
 }
 
-/// Whether the render tick still has work: a fade in progress, or live mic bars
-/// while the recording HUD is visible.
-fn is_animating(state: &UiState) -> bool {
-    (state.opacity.get() - state.target_opacity.get()).abs() > 0.001
-        || (state.shown.get() && state.card.has_css_class("state-recording"))
+/// The waveform animates both while recording (live mic level) and while busy
+/// (a gentle processing shimmer).
+fn wave_active(state: &UiState) -> bool {
+    state.shown.get()
+        && (state.card.has_css_class("state-recording") || state.card.has_css_class("state-busy"))
 }
 
-/// Arms the 90ms spinner tick if it isn't already running. Suspends itself as
-/// soon as the overlay leaves the busy state.
-fn ensure_spinner(state: &Rc<UiState>) {
-    if state.spinner_source.borrow().is_some() {
-        return;
-    }
-    let spinner_state = Rc::clone(state);
-    let id = glib::timeout_add_local(std::time::Duration::from_millis(90), move || {
-        if spinner_state.shown.get() && spinner_state.card.has_css_class("state-busy") {
-            let next = (spinner_state.spinner_frame.get() + 1) % BRAILLE_FRAMES.len() as u32;
-            spinner_state.spinner_frame.set(next);
-            spinner_state
-                .glyph
-                .set_markup(&mono(BRAILLE_FRAMES[next as usize]));
-            ControlFlow::Continue
-        } else {
-            *spinner_state.spinner_source.borrow_mut() = None;
-            ControlFlow::Break
-        }
-    });
-    *state.spinner_source.borrow_mut() = Some(id);
+/// Whether the render tick still has work: a fade in progress, or a live/shimmer
+/// waveform while the pill is visible.
+fn is_animating(state: &UiState) -> bool {
+    (state.opacity.get() - state.target_opacity.get()).abs() > 0.001 || wave_active(state)
 }
 
 struct UiState {
@@ -535,8 +490,7 @@ struct UiState {
     card: gtk::Box,
     glyph: gtk::Label,
     message: gtk::Label,
-    bars: Bars,
-    spinner_frame: Cell<u32>,
+    wave: Wave,
     /// Current card opacity, driven toward `target_opacity` by the render tick
     /// so every show/hide eases instead of snapping.
     opacity: Cell<f64>,
@@ -550,48 +504,91 @@ struct UiState {
     /// Handle to the running animation tick, if any. `None` means no tick is
     /// scheduled (idle overlay), so `ensure_render_tick` knows to start one.
     render_source: RefCell<Option<glib::SourceId>>,
-    /// Handle to the running spinner tick, if any.
-    spinner_source: RefCell<Option<glib::SourceId>>,
 }
 
-struct Bars {
-    container: gtk::Box,
-    widgets: Vec<gtk::LevelBar>,
-    /// Per-bar displayed values, eased toward `targets` each render tick so the
-    /// meter glides instead of stepping on every (~64ms) mic sample.
-    values: RefCell<Vec<f64>>,
-    targets: RefCell<Vec<f64>>,
+#[derive(Clone, Copy, PartialEq)]
+enum WaveKind {
+    Listening,
+    Processing,
 }
 
-fn build_bars() -> Bars {
-    let container = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(3)
-        .valign(gtk::Align::Center)
-        .build();
-    container.add_css_class("bars");
-    let mut widgets = Vec::new();
-    for _ in 0..7 {
-        let bar = gtk::LevelBar::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .min_value(0.0)
-            .max_value(1.0)
-            .value(0.05)
-            .inverted(true)
-            .build();
-        bar.set_size_request(3, 24);
-        bar.add_css_class("wave");
-        widgets.push(bar.clone());
-        container.append(&bar);
+/// A Cairo-drawn voice meter: a row of rounded bars that ripple outward from the
+/// centre, driven by the live mic level (and a low shimmer while processing).
+struct Wave {
+    area: gtk::DrawingArea,
+    /// Displayed amplitude per bar (centre-out scroll buffer).
+    bars: Rc<RefCell<Vec<f64>>>,
+    /// Latest eased input level injected at the centre.
+    level: Cell<f64>,
+    /// Raw target the level eases toward (fast attack, slow release).
+    target_level: Cell<f64>,
+    /// Free-running phase for the shimmer / liveliness variation.
+    phase: Cell<f64>,
+    /// Whether to draw the listening or processing palette.
+    kind: Rc<Cell<WaveKind>>,
+}
+
+fn build_wave() -> Wave {
+    let area = gtk::DrawingArea::new();
+    area.set_content_width(WAVE_W);
+    area.set_content_height(WAVE_H);
+    area.set_valign(gtk::Align::Center);
+    area.add_css_class("wave");
+
+    let bars = Rc::new(RefCell::new(vec![0.0_f64; BAR_COUNT]));
+    let kind = Rc::new(Cell::new(WaveKind::Listening));
+
+    let bars_for_draw = bars.clone();
+    let kind_for_draw = kind.clone();
+    area.set_draw_func(move |_, cr, width, height| {
+        draw_wave(cr, width, height, &bars_for_draw.borrow(), kind_for_draw.get());
+    });
+
+    Wave {
+        area,
+        bars,
+        level: Cell::new(0.0),
+        target_level: Cell::new(0.0),
+        phase: Cell::new(0.0),
+        kind,
     }
-    container.hide();
-    let count = widgets.len();
-    Bars {
-        container,
-        widgets,
-        values: RefCell::new(vec![0.05; count]),
-        targets: RefCell::new(vec![0.05; count]),
+}
+
+fn draw_wave(cr: &gtk::cairo::Context, width: i32, height: i32, bars: &[f64], kind: WaveKind) {
+    let n = bars.len();
+    if n == 0 {
+        return;
     }
+    let w = width as f64;
+    let h = height as f64;
+    let mid = h / 2.0;
+    let gap = 2.0;
+    let bar_w = ((w - gap * (n as f64 - 1.0)) / n as f64).max(1.0);
+    let min_h = 2.0;
+
+    let (r, g, b, a) = match kind {
+        WaveKind::Listening => (0.87, 0.91, 1.0, 0.96),
+        WaveKind::Processing => (0.49, 0.64, 1.0, 0.85),
+    };
+    cr.set_source_rgba(r, g, b, a);
+
+    for (i, &value) in bars.iter().enumerate() {
+        let x = i as f64 * (bar_w + gap);
+        let bh = (value.clamp(0.0, 1.0) * h).max(min_h);
+        let y = mid - bh / 2.0;
+        rounded_bar(cr, x, y, bar_w, bh, bar_w / 2.0);
+    }
+    let _ = cr.fill();
+}
+
+fn rounded_bar(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, radius: f64) {
+    let r = radius.min(w / 2.0).min(h / 2.0);
+    cr.new_sub_path();
+    cr.arc(x + w - r, y + r, r, -FRAC_PI_2, 0.0);
+    cr.arc(x + w - r, y + h - r, r, 0.0, FRAC_PI_2);
+    cr.arc(x + r, y + h - r, r, FRAC_PI_2, PI);
+    cr.arc(x + r, y + r, r, PI, PI + FRAC_PI_2);
+    cr.close_path();
 }
 
 fn set_state_class(state: &UiState, name: &str) {
@@ -601,13 +598,6 @@ fn set_state_class(state: &UiState, name: &str) {
     }
     state.card.add_css_class(name);
     state.window.add_css_class(name);
-}
-
-fn mono(text: &str) -> String {
-    format!(
-        "<span font_family=\"IBM Plex Mono,JetBrains Mono,Iosevka,Fira Code,monospace\">{}</span>",
-        glib::markup_escape_text(text)
-    )
 }
 
 fn apply_message(state: &Rc<UiState>, message: OverlayMessage) {
@@ -620,18 +610,13 @@ fn apply_message(state: &Rc<UiState>, message: OverlayMessage) {
             grab_keyboard,
         } => {
             set_state_class(state, "state-busy");
-            // Restart the spinner from frame 0 so every busy phase begins at a
-            // consistent point instead of wherever the previous cycle stopped.
-            state.spinner_frame.set(0);
-            state.glyph.set_markup(&mono(BRAILLE_FRAMES[0]));
-            ensure_spinner(state);
-            state.bars.container.hide();
+            state.glyph.set_visible(false);
+            state.wave.kind.set(WaveKind::Processing);
+            state.wave.area.set_visible(true);
+            state.message.set_visible(true);
             state.message.set_label(&label);
-            // Exclusive keyboard focus is how Esc-to-cancel actually works on
-            // layer-shell compositors — On-demand only delivers keys after an
-            // explicit click, and None blocks them entirely. The daemon only
-            // asks for a grab during phases where no other window needs focus
-            // (i.e. engine/whisper running), so it's safe to steal input here.
+            // An exclusive grab is how Esc-to-cancel works on layer-shell; the
+            // daemon only asks for it when no other window needs focus.
             let mode = if grab_keyboard {
                 layer_shell::KeyboardMode::Exclusive
             } else {
@@ -640,30 +625,27 @@ fn apply_message(state: &Rc<UiState>, message: OverlayMessage) {
             state.window.set_keyboard_mode(mode);
             request_show(state, grab_keyboard);
         }
-        OverlayMessage::Recording { level, transcript } => {
+        OverlayMessage::Recording { level } => {
             set_state_class(state, "state-recording");
-            state.glyph.set_markup(&mono("●"));
-            state.bars.container.show();
-            state
-                .message
-                .set_label(&transcript.unwrap_or_else(|| "Listening…".into()));
-            // During recording the user is speaking, not typing, so grabbing
-            // the keyboard exclusively is safe and makes Esc-to-cancel work.
+            state.glyph.set_visible(true);
+            state.glyph.set_label("●");
+            state.wave.kind.set(WaveKind::Listening);
+            state.wave.area.set_visible(true);
+            // Listening shows only the waveform (Wispr-style).
+            state.message.set_visible(false);
+            // The user is speaking, not typing, so the exclusive grab (for Esc) is safe.
             state
                 .window
                 .set_keyboard_mode(layer_shell::KeyboardMode::Exclusive);
-            set_bar_targets(&state.bars, level);
+            set_wave_level(&state.wave, level);
             request_show(state, true);
         }
         OverlayMessage::Result { ok, message } => {
-            if ok {
-                set_state_class(state, "state-success");
-                state.glyph.set_markup(&mono("✓"));
-            } else {
-                set_state_class(state, "state-error");
-                state.glyph.set_markup(&mono("✕"));
-            }
-            state.bars.container.hide();
+            set_state_class(state, if ok { "state-success" } else { "state-error" });
+            state.glyph.set_visible(true);
+            state.glyph.set_label(if ok { "✓" } else { "✕" });
+            state.wave.area.set_visible(false);
+            state.message.set_visible(true);
             state.message.set_label(&message);
             state
                 .window
@@ -672,8 +654,10 @@ fn apply_message(state: &Rc<UiState>, message: OverlayMessage) {
         }
         OverlayMessage::Notice { message } => {
             set_state_class(state, "state-notice");
-            state.glyph.set_markup(&mono("·"));
-            state.bars.container.hide();
+            state.glyph.set_visible(true);
+            state.glyph.set_label("·");
+            state.wave.area.set_visible(false);
+            state.message.set_visible(true);
             state.message.set_label(&message);
             state
                 .window
@@ -683,36 +667,52 @@ fn apply_message(state: &Rc<UiState>, message: OverlayMessage) {
     }
 }
 
-/// Maps the latest mic level onto per-bar target heights. The displayed bars
-/// then ease toward these in `step_bars` so the meter never jumps.
-fn set_bar_targets(bars: &Bars, level: f32) {
-    // Apply sqrt to convert linear RMS into a perceptually-proportional scale.
-    // Raw RMS for speech is typically 0.02–0.15; sqrt expands that into a
-    // range where bar movement is clearly visible across the full volume span.
+/// Maps the latest mic level onto the amplitude injected at the waveform centre.
+/// `sqrt` turns linear RMS (speech is typically 0.02–0.15) into a perceptually
+/// proportional scale where bar movement is visible across the whole volume span.
+fn set_wave_level(wave: &Wave, level: f32) {
     let perceptual = level.sqrt();
-    let multipliers = [0.35, 0.58, 0.82, 1.0, 0.82, 0.58, 0.35];
-    let mut targets = bars.targets.borrow_mut();
-    for (target, factor) in targets.iter_mut().zip(multipliers) {
-        *target = (perceptual * 2.5 * factor).clamp(0.05, 1.0) as f64;
-    }
+    wave.target_level
+        .set((perceptual as f64 * 1.8).clamp(0.0, 1.0));
 }
 
-/// Eases each bar toward its target with a fast attack and slower release —
-/// the same asymmetry real VU meters use, so loud peaks snap up but decay back
-/// down smoothly.
-fn step_bars(bars: &Bars) {
-    let targets = bars.targets.borrow();
-    let mut values = bars.values.borrow_mut();
-    for ((bar, value), &target) in bars
-        .widgets
-        .iter()
-        .zip(values.iter_mut())
-        .zip(targets.iter())
+/// Advances the waveform one frame: ease the level (fast attack, slow release),
+/// scroll the bar buffer outward from the centre, and inject the newest
+/// amplitude (or a gentle shimmer while processing) at the centre bar.
+fn step_wave(wave: &Wave) {
+    let target = wave.target_level.get();
+    let current = wave.level.get();
+    let smoothing = if target > current { 0.6 } else { 0.25 };
+    let level = current + (target - current) * smoothing;
+    wave.level.set(level);
+
+    let phase = wave.phase.get() + 0.4;
+    wave.phase.set(phase);
+
+    let injected = match wave.kind.get() {
+        WaveKind::Processing => 0.10 + 0.06 * (phase.sin() * 0.5 + 0.5),
+        WaveKind::Listening => {
+            let variation = 0.78 + 0.22 * (phase * 1.7).sin().abs();
+            (level * variation).clamp(0.0, 1.0)
+        }
+    };
+
     {
-        let smoothing = if target > *value { 0.6 } else { 0.25 };
-        *value += (target - *value) * smoothing;
-        bar.set_value(value.clamp(0.05, 1.0));
+        let mut bars = wave.bars.borrow_mut();
+        let n = bars.len();
+        if n == 0 {
+            return;
+        }
+        let center = n / 2;
+        for i in 0..center {
+            bars[i] = bars[i + 1];
+        }
+        for i in (center + 1..n).rev() {
+            bars[i] = bars[i - 1];
+        }
+        bars[center] = injected;
     }
+    wave.area.queue_draw();
 }
 
 /// Marks the overlay to fade in (or stay visible) and presents/shows the
@@ -748,7 +748,6 @@ fn begin_hide(state: &UiState) {
 
 fn finish_hide(state: &UiState) {
     state.window.hide();
-    state.bars.container.hide();
     state.shown.set(false);
     state.pending_hide.set(false);
     set_state_class(state, "state-idle");
@@ -802,17 +801,15 @@ fn send_cancel() {
 fn install_css() {
     let display = gtk::gdk::Display::default().expect("display not available");
 
-    // Fallback palette: only applies when the active GTK theme doesn't define
-    // these semantic colors. Theme providers sit at PRIORITY_THEME (200),
-    // which overrides our PRIORITY_FALLBACK (1), so Adwaita & modern themes
-    // win and we only fill in when a minimal theme leaves them undefined.
+    // Fallback palette at PRIORITY_FALLBACK: real themes (PRIORITY_THEME) win;
+    // this only fills in semantic colors a minimal theme leaves undefined.
     let fallback = gtk::CssProvider::new();
     fallback.load_from_data(
         r#"
-        @define-color card_bg_color #1e242f;
-        @define-color card_fg_color #e9edf3;
-        @define-color window_bg_color #1e242f;
-        @define-color window_fg_color #e9edf3;
+        @define-color card_bg_color #15181f;
+        @define-color card_fg_color #eef1f6;
+        @define-color window_bg_color #15181f;
+        @define-color window_fg_color #eef1f6;
         @define-color accent_bg_color #7aa2ff;
         @define-color accent_color #7aa2ff;
         @define-color success_color #74d39f;
@@ -834,114 +831,80 @@ fn install_css() {
             background: transparent;
         }
 
-        /* --- HUD overlay --- */
+        /* --- HUD pill --- */
 
         .papagaia-card {
-            padding: 8px 14px;
-            background: linear-gradient(160deg, shade(@card_bg_color, 1.08) 0%, shade(@card_bg_color, 0.88) 100%);
+            /* margin leaves room for the drop shadow to render unclipped */
+            margin: 14px;
+            padding: 6px 15px;
+            background: alpha(@card_bg_color, 0.88);
             color: @card_fg_color;
-            border-radius: 12px;
-            border-left: 3px solid @borders;
-            min-width: 180px;
-            transition: border-left-color 220ms ease,
-                        border-top-color 220ms ease,
-                        border-right-color 220ms ease,
-                        border-bottom-color 220ms ease;
+            border-radius: 9999px;
+            border: 1px solid alpha(@card_fg_color, 0.10);
+            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
         }
 
         .glyph {
-            font-size: 12px;
+            font-size: 10px;
             font-weight: 700;
-            color: alpha(@card_fg_color, 0.55);
-            min-width: 14px;
-            transition: color 200ms ease;
+            min-width: 10px;
+            color: alpha(@card_fg_color, 0.6);
         }
 
         .message {
-            font-family: "IBM Plex Sans", "Inter Tight", "Cantarell", sans-serif;
+            font-family: "Inter", "IBM Plex Sans", "Cantarell", sans-serif;
             font-size: 12px;
-            font-weight: 400;
+            font-weight: 500;
             color: @card_fg_color;
         }
 
-        levelbar.wave trough {
-            background: alpha(@card_fg_color, 0.08);
-            border-radius: 2px;
-            min-width: 3px;
-        }
-
-        levelbar.wave block.filled {
-            background: @warning_color;
-            border-radius: 2px;
-            min-width: 3px;
-            box-shadow: 0 0 8px alpha(@warning_color, 0.55);
-            transition: background-color 200ms ease, box-shadow 200ms ease;
-        }
-
-        levelbar.wave block.empty {
-            background: transparent;
-            min-width: 3px;
-        }
-
-        .state-busy.papagaia-card { border-left-color: @accent_bg_color; }
-        .state-busy .glyph { color: @accent_bg_color; }
-
-        .state-recording.papagaia-card { border-left-color: @warning_color; }
         .state-recording .glyph {
-            color: @warning_color;
-            animation: papagaia-rec-pulse 1.4s ease-in-out infinite;
+            color: @error_color;
+            animation: papagaia-rec-pulse 1.3s ease-in-out infinite;
         }
 
         @keyframes papagaia-rec-pulse {
             0% { opacity: 1; }
-            50% { opacity: 0.3; }
+            50% { opacity: 0.2; }
             100% { opacity: 1; }
         }
 
-        .state-success.papagaia-card {
-            border-left-color: @success_color;
-            border-top-color: alpha(@success_color, 0.22);
-            border-right-color: alpha(@success_color, 0.22);
-            border-bottom-color: alpha(@success_color, 0.22);
-        }
         .state-success .glyph { color: @success_color; }
-
-        .state-error.papagaia-card {
-            border-left-color: @error_color;
-            border-top-color: alpha(@error_color, 0.26);
-            border-right-color: alpha(@error_color, 0.26);
-            border-bottom-color: alpha(@error_color, 0.26);
-        }
         .state-error .glyph { color: @error_color; }
-
-        .state-notice.papagaia-card { border-left-color: @borders; }
+        .state-error .message { color: @error_color; }
         .state-notice .glyph { color: alpha(@card_fg_color, 0.45); }
         .state-notice .message { color: alpha(@card_fg_color, 0.7); }
 
         /* --- Picker --- */
 
+        /* Same visual language as the HUD pill: flat translucent surface, a
+           hairline border, a soft shadow, and the Inter UI font.
+           NOTE: the window is sized to the card + its margin, so the shadow's
+           reach (offset + blur) must fit inside `margin` or layer-shell clips it
+           into a hard rectangle. margin 26 contains this 0 6px 18px shadow. */
         .picker-card {
-            background: linear-gradient(160deg, shade(@card_bg_color, 1.08) 0%, shade(@card_bg_color, 0.88) 100%);
+            margin: 26px;
+            background: alpha(@card_bg_color, 0.92);
             color: @card_fg_color;
-            border-radius: 14px;
-            border: 1px solid @borders;
-            box-shadow: none;
+            border-radius: 16px;
+            border: 1px solid alpha(@card_fg_color, 0.10);
+            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
             min-width: 420px;
         }
 
         .picker-input {
-            background: alpha(@card_fg_color, 0.04);
+            background: alpha(@card_fg_color, 0.05);
             color: @card_fg_color;
             border: none;
-            border-radius: 14px 14px 0 0;
-            padding: 14px 18px;
-            font-family: "IBM Plex Mono", "JetBrains Mono", "Iosevka", "Fira Code", monospace;
+            border-radius: 16px 16px 0 0;
+            padding: 13px 18px;
+            font-family: "Inter", "IBM Plex Sans", "Cantarell", sans-serif;
             font-size: 14px;
             box-shadow: none;
         }
 
         .picker-input.picker-input-alone {
-            border-radius: 14px;
+            border-radius: 16px;
         }
 
         .picker-input:focus {
@@ -949,7 +912,7 @@ fn install_css() {
         }
 
         .picker-divider {
-            background: @borders;
+            background: alpha(@card_fg_color, 0.10);
             min-height: 1px;
         }
 
@@ -963,17 +926,18 @@ fn install_css() {
         }
 
         .picker-list row:selected {
-            background: alpha(@accent_bg_color, 0.14);
+            background: alpha(@accent_bg_color, 0.16);
         }
 
         .row-name {
-            font-family: "IBM Plex Mono", "JetBrains Mono", "Iosevka", "Fira Code", monospace;
+            font-family: "Inter", "IBM Plex Sans", "Cantarell", sans-serif;
             font-size: 13px;
             font-weight: 600;
             color: @card_fg_color;
         }
 
         .row-summary {
+            font-family: "Inter", "IBM Plex Sans", "Cantarell", sans-serif;
             font-size: 12px;
             color: alpha(@card_fg_color, 0.55);
         }
@@ -1018,15 +982,11 @@ mod tests {
     }
 
     #[test]
-    fn plain_picker_text_uses_streaming_raw_defaults() {
+    fn plain_picker_text_resolves_to_raw() {
         let result = parse_picker_raw("Fix this: {{text}}").expect("picker should resolve");
         match result {
-            PickerResult::Raw {
-                template,
-                stream_output,
-            } => {
+            PickerResult::Raw { template } => {
                 assert_eq!(template, "Fix this: {{text}}");
-                assert!(stream_output);
             }
             PickerResult::Template { .. } => panic!("expected raw picker result"),
         }

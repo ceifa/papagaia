@@ -1,9 +1,9 @@
 use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub logging: bool,
@@ -15,6 +15,8 @@ pub struct Config {
     pub whisper: WhisperConfig,
     #[serde(default)]
     pub dictation: DictationConfig,
+    #[serde(default)]
+    pub keybinds: KeybindsConfig,
     /// The engine chain used for text transformation. Accepts either a single
     /// `[engine]` table or a sequence of `[[engine]]` tables tried in order:
     /// when one fails, the next is attempted as a fallback.
@@ -93,7 +95,7 @@ impl Config {
             &mut self.tools.copy_command,
             &mut self.tools.paste_command,
             &mut self.whisper.argv,
-            &mut self.dictation.window_title_command,
+            &mut self.whisper.server_argv,
         ];
         for argv in argv_fields {
             for arg in argv.iter_mut() {
@@ -108,7 +110,7 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ToolConfig {
     #[serde(default = "default_read_clipboard_command")]
     pub read_clipboard_command: Vec<String>,
@@ -134,7 +136,7 @@ impl Default for ToolConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct OverlayConfig {
     #[serde(default = "default_overlay_enabled")]
     pub enabled: bool,
@@ -148,73 +150,137 @@ impl Default for OverlayConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct DictationConfig {
-    /// Post-process the whisper transcript through the LLM engine.
+    /// Local, rule-based cleanup applied to every transcript before it is typed.
+    /// Fast and deterministic — no LLM involved.
     #[serde(default)]
-    pub post_process: bool,
-    /// Stream post-processed output incrementally as the engine produces it.
-    #[serde(default = "crate::default_true")]
-    pub stream_post_process: bool,
-    /// Prompt template for post-processing. Uses `{{text}}` for the transcript
-    /// and `{{context}}` for an auto-generated context block.
-    #[serde(default = "default_dictation_template")]
-    pub post_process_template: String,
-    /// Capture the focused window title before recording to provide context
-    /// for post-processing.
-    #[serde(default)]
-    pub context_awareness: bool,
-    /// Command that returns the focused window information (title, app id).
-    /// Supports JSON output from niri, hyprctl, and sway.
-    #[serde(default)]
-    pub window_title_command: Vec<String>,
-    /// Keep recorded WAV files in /tmp instead of deleting them after
-    /// transcription. Useful for diagnosing audio capture issues.
-    #[serde(default)]
-    pub keep_audio_files: bool,
+    pub cleanup: CleanupConfig,
 }
 
-impl Default for DictationConfig {
+/// Global hotkeys papagaia watches itself (via evdev), so you don't configure
+/// them in your compositor. Each value is a key name ("RightCtrl", "F13", "Menu",
+/// or a raw evdev keycode); empty means that action has no hotkey.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KeybindsConfig {
+    /// Hold to dictate: records while held, transcribes and inserts on release.
+    #[serde(default = "default_push_to_talk_key")]
+    pub push_to_talk: String,
+    /// Tap to toggle hands-free dictation on/off.
+    #[serde(default)]
+    pub toggle: String,
+    /// Tap to open the prompt picker.
+    #[serde(default)]
+    pub pick: String,
+}
+
+impl Default for KeybindsConfig {
     fn default() -> Self {
         Self {
-            post_process: false,
-            stream_post_process: true,
-            post_process_template: default_dictation_template(),
-            context_awareness: false,
-            window_title_command: Vec::new(),
-            keep_audio_files: false,
+            push_to_talk: default_push_to_talk_key(),
+            toggle: String::new(),
+            pick: String::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Toggles for the local transcript cleanup pass. Every transform is individually
+/// switchable; conservative by default so meaning is never lost.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CleanupConfig {
+    /// Interpret literal voice commands ("new line"/"nova linha" → line break,
+    /// "period"/"ponto final" → ".", "comma"/"vírgula" → ",", …). Applied first.
+    #[serde(default = "crate::default_true")]
+    pub voice_commands: bool,
+    /// Collapse immediately-repeated words ("the the" → "the").
+    #[serde(default = "crate::default_true")]
+    pub dedupe_repeated_words: bool,
+    /// Collapse runs of spaces and trim trailing whitespace (keeps line breaks).
+    #[serde(default = "crate::default_true")]
+    pub collapse_whitespace: bool,
+    /// Capitalize the first letter of each sentence.
+    #[serde(default = "crate::default_true")]
+    pub capitalize_sentences: bool,
+    /// Remove standalone filler words. Off by default — it can change meaning.
+    #[serde(default)]
+    pub remove_fillers: bool,
+    /// Filler words removed when `remove_fillers` is enabled.
+    #[serde(default = "default_filler_words")]
+    pub filler_words: Vec<String>,
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            voice_commands: true,
+            dedupe_repeated_words: true,
+            collapse_whitespace: true,
+            capitalize_sentences: true,
+            remove_fillers: false,
+            filler_words: default_filler_words(),
+        }
+    }
+}
+
+/// Which transcription backend powers dictation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WhisperBackend {
+    /// Shell out to `whisper-cli` once per recording. Simple, but reloads the
+    /// model on every call (a noticeable cold start even with GPU acceleration).
+    #[default]
+    Cli,
+    /// POST audio to a warm `whisper-server` that keeps the model resident in
+    /// RAM/VRAM. Far lower per-call latency. Falls back to `cli` when the server
+    /// is unreachable.
+    Server,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct WhisperConfig {
+    #[serde(default)]
+    pub backend: WhisperBackend,
     #[serde(default = "default_whisper_model")]
     pub model: String,
+    /// Initial prompt shared by both backends; inject it into `argv`/`server_argv`
+    /// via the `{{prompt}}` placeholder so the text lives in one place.
+    #[serde(default = "default_whisper_prompt")]
+    pub prompt: String,
     #[serde(default = "default_whisper_argv")]
     pub argv: Vec<String>,
+    /// Base URL of the whisper-server used by the `server` backend.
+    #[serde(default = "default_whisper_server_url")]
+    pub server_url: String,
+    /// When true (and backend = server), the daemon spawns and supervises the
+    /// whisper-server child itself, killing it when the daemon exits.
     #[serde(default = "crate::default_true")]
-    pub capture_stdout: bool,
+    pub manage_server: bool,
+    /// Command used to launch the managed whisper-server. `{{model}}` expands to
+    /// `model`. Only consulted when `manage_server` is true.
+    #[serde(default = "default_whisper_server_argv")]
+    pub server_argv: Vec<String>,
 }
 
 impl Default for WhisperConfig {
     fn default() -> Self {
         Self {
+            backend: WhisperBackend::default(),
             model: default_whisper_model(),
+            prompt: default_whisper_prompt(),
             argv: default_whisper_argv(),
-            capture_stdout: true,
+            server_url: default_whisper_server_url(),
+            manage_server: true,
+            server_argv: default_whisper_server_argv(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct EngineConfig {
     #[serde(default)]
     pub argv: Vec<String>,
     #[serde(default)]
     pub stdin: bool,
-    #[serde(default = "crate::default_true")]
-    pub capture_stdout: bool,
 }
 
 /// Deserialize the `engine` field from either a single `[engine]` table or a
@@ -237,12 +303,10 @@ where
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PromptConfig {
     pub name: String,
     pub template: String,
-    #[serde(default)]
-    pub stream_output: bool,
 }
 
 impl PromptConfig {
@@ -260,6 +324,22 @@ impl PromptConfig {
 /// selection (if any) to the end of the template instead.
 pub fn template_needs_selection(template: &str) -> bool {
     template.contains("{{text}}") || template.contains("{{selection}}")
+}
+
+/// One-line summary of a prompt template — its first non-empty line, truncated.
+/// Used by both the CLI's `prompt list` and the daemon-driven picker.
+pub fn prompt_summary(template: &str) -> String {
+    const MAX_LEN: usize = 72;
+    let first_line = template
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    if first_line.chars().count() <= MAX_LEN {
+        return first_line.to_string();
+    }
+    let truncated: String = first_line.chars().take(MAX_LEN - 1).collect();
+    format!("{truncated}…")
 }
 
 pub fn render_prompt_template(template: &str, selected_text: &str) -> String {
@@ -348,26 +428,93 @@ fn default_overlay_enabled() -> bool {
     true
 }
 
-fn default_dictation_template() -> String {
-    r#"You are a voice-to-text post-processor. Your job is to turn raw speech transcription into clean, ready-to-use text.
-
-Rules:
-- Fix punctuation, capitalization, and grammar
-- Remove filler words and speech artifacts (um, uh, like, you know, so, basically, I mean, right, well, tipo, né, então)
-- Remove false starts and repeated words ("I want to I want to go" → "I want to go")
-- Interpret voice commands literally: "new line" or "nova linha" → insert a line break, "new paragraph" or "novo parágrafo" → insert two line breaks, "period" or "ponto final" → ".", "comma" or "vírgula" → ","
-- Preserve the original language — do not translate
-- Preserve the speaker's meaning, intent, and tone
-- Do not add, invent, or editorialize any content
-- Output only the cleaned text, nothing else — no preamble, no quotes, no explanation
-{{context}}
-Transcription:
-{{text}}"#
-        .into()
-}
-
 fn default_clipboard_settle_ms() -> u64 {
     120
+}
+
+fn default_whisper_server_url() -> String {
+    "http://127.0.0.1:8080".into()
+}
+
+fn default_whisper_server_argv() -> Vec<String> {
+    vec![
+        "whisper-server".into(),
+        "-m".into(),
+        "{{model}}".into(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        "8080".into(),
+        "-l".into(),
+        "auto".into(),
+        "--prompt".into(),
+        "{{prompt}}".into(),
+    ]
+}
+
+fn default_push_to_talk_key() -> String {
+    "RightCtrl".into()
+}
+
+fn default_filler_words() -> Vec<String> {
+    ["um", "uh", "uhm", "hmm", "er", "ah", "né", "tipo", "então"]
+        .iter()
+        .map(|word| word.to_string())
+        .collect()
+}
+
+/// Map a key name ("RightCtrl", "F13", "Menu") or a raw evdev keycode to its
+/// Linux input-event code (case-insensitive; ignores a `key_` prefix and any
+/// spaces/underscores/hyphens). In core, so it stays free of the `evdev` dep.
+pub fn parse_key_name(name: &str) -> Option<u16> {
+    let mut norm = name.trim().to_lowercase();
+    if let Some(stripped) = norm.strip_prefix("key_") {
+        norm = stripped.to_string();
+    }
+    norm.retain(|c| c != ' ' && c != '_' && c != '-');
+
+    // Raw numeric escape hatch (a literal evdev keycode).
+    if let Ok(code) = norm.parse::<u16>() {
+        return Some(code);
+    }
+
+    // Function keys F1..F24 (the Linux codes are not contiguous across the range).
+    if let Some(rest) = norm.strip_prefix('f')
+        && let Ok(n) = rest.parse::<u16>()
+    {
+        return match n {
+            1..=10 => Some(59 + (n - 1)), // F1=59 .. F10=68
+            11 => Some(87),
+            12 => Some(88),
+            13..=24 => Some(183 + (n - 13)), // F13=183 .. F24=194
+            _ => None,
+        };
+    }
+
+    Some(match norm.as_str() {
+        "rightctrl" | "rctrl" | "ctrlr" => 97,
+        "leftctrl" | "lctrl" | "ctrl" | "ctrll" => 29,
+        "rightalt" | "ralt" | "altr" | "altgr" => 100,
+        "leftalt" | "lalt" | "alt" | "altl" => 56,
+        "rightshift" | "rshift" | "shiftr" => 54,
+        "leftshift" | "lshift" | "shift" | "shiftl" => 42,
+        "rightmeta" | "rmeta" | "rightsuper" | "rsuper" | "rightwin" | "rwin" => 126,
+        "leftmeta" | "lmeta" | "meta" | "super" | "leftsuper" | "lsuper" | "win" | "leftwin"
+        | "lwin" => 125,
+        "capslock" | "caps" => 58,
+        "menu" | "compose" | "apps" => 127,
+        "scrolllock" | "scroll" => 70,
+        "pause" => 119,
+        "insert" | "ins" => 110,
+        "home" => 102,
+        "end" => 107,
+        "pageup" | "pgup" => 104,
+        "pagedown" | "pgdn" => 109,
+        "space" => 57,
+        "tab" => 15,
+        "grave" | "backtick" => 41,
+        _ => return None,
+    })
 }
 
 fn default_read_clipboard_command() -> Vec<String> {
@@ -390,6 +537,10 @@ fn default_whisper_model() -> String {
     "~/.local/share/whisper.cpp/ggml-base.bin".into()
 }
 
+fn default_whisper_prompt() -> String {
+    "Natural spoken dictation with correct punctuation, natural sentences, and no filler words.".into()
+}
+
 fn default_whisper_argv() -> Vec<String> {
     vec![
         "whisper-cli".into(),
@@ -406,7 +557,7 @@ fn default_whisper_argv() -> Vec<String> {
         "-bs".into(),
         "3".into(),
         "--prompt".into(),
-        "Natural spoken dictation with correct punctuation, natural sentences, and no filler words.".into(),
+        "{{prompt}}".into(),
     ]
 }
 
@@ -436,7 +587,39 @@ fn wtype_paste_command() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PromptConfig, expand_home, render_prompt_template, strip_outer_markdown_fence};
+    use super::{
+        PromptConfig, WhisperConfig, expand_home, parse_key_name, render_prompt_template,
+        strip_outer_markdown_fence,
+    };
+
+    #[test]
+    fn whisper_prompt_is_shared_by_both_backends_via_placeholder() {
+        let whisper = WhisperConfig::default();
+        assert!(!whisper.prompt.is_empty());
+        for (name, argv) in [("argv", &whisper.argv), ("server_argv", &whisper.server_argv)] {
+            assert!(
+                argv.iter().any(|arg| arg == "{{prompt}}"),
+                "{name} should reference the prompt placeholder"
+            );
+            assert!(
+                !argv.iter().any(|arg| arg.contains(&whisper.prompt)),
+                "{name} should not duplicate the literal prompt text"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_key_name_handles_names_aliases_and_codes() {
+        assert_eq!(parse_key_name("RightCtrl"), Some(97));
+        assert_eq!(parse_key_name("right ctrl"), Some(97));
+        assert_eq!(parse_key_name("KEY_RIGHTCTRL"), Some(97));
+        assert_eq!(parse_key_name("rctrl"), Some(97));
+        assert_eq!(parse_key_name("F13"), Some(183));
+        assert_eq!(parse_key_name("f1"), Some(59));
+        assert_eq!(parse_key_name("menu"), Some(127));
+        assert_eq!(parse_key_name("97"), Some(97));
+        assert_eq!(parse_key_name("not-a-key"), None);
+    }
 
     #[test]
     fn strips_outer_markdown_fence() {
@@ -449,7 +632,6 @@ mod tests {
         let prompt = PromptConfig {
             name: "test".into(),
             template: "hello {{text}}".into(),
-            stream_output: false,
         };
 
         assert_eq!(prompt.render("world"), "hello world");

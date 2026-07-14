@@ -6,7 +6,7 @@ A lightweight voice-writing and text-rewriting tool for Linux Wayland desktops, 
 
 - **Dictation**: record speech, transcribe locally, type the result into the focused app
 - **Text transformation**: copy selection, run it through an LLM, paste the result back
-- **Compositor-native**: designed around keybindings, small CLI commands, and Wayland tooling
+- **Own hotkeys**: global keys watched via evdev — no compositor keybindings to set up
 - **BYO tooling**: plug in your own speech-to-text CLI, LLM CLI, clipboard tools, and typing backend
 
 ## Quick Start
@@ -26,39 +26,55 @@ If systemd setup was skipped, start the daemon manually: `./target/release/papag
 
 ```bash
 papagaia prompt list                  # list saved prompts
-papagaia prompt run fix-grammar       # run a prompt on selected text
-papagaia prompt run shorten
-papagaia prompt pick                  # open the overlay picker
+papagaia prompt run fix-grammar       # run a prompt on the selection
 papagaia prompt raw --text 'Rewrite clearly: {{text}}'   # ad-hoc prompt
 ```
 
-Ad-hoc prompts without `{{text}}` automatically append the selection. You can also pipe via `--stdin`.
-
-Add `--stream-output` to type results incrementally into the target app.
+The daemon grabs the current selection, runs it through the `[engine]`, and pastes the result.
+Ad-hoc prompts without `{{text}}` append the selection; or pipe via `--stdin`. To open the
+picker instead, bind a `pick` key (see [Keybinds](#keybinds)).
 
 ### Dictation
 
-```bash
-papagaia dictate toggle     # toggle recording
-papagaia dictate start      # explicit start
-papagaia dictate stop       # explicit stop
+papagaia owns its hotkeys directly (see [Keybinds](#keybinds)) — you trigger dictation with a
+key, not a CLI command. It's built for speed:
+
+- **Warm transcription.** With `[whisper].backend = "server"` the daemon launches and
+  supervises a `whisper-server` that keeps the model resident in memory, so each utterance
+  skips the per-call model load. It falls back to `whisper-cli` automatically if the server
+  isn't reachable. (`backend = "cli"` keeps the original per-call behaviour.)
+- **Instant local cleanup, no LLM.** Fast rule-based polish on every transcript: voice commands
+  ("new line"/"nova linha" → break, "period"/"ponto final" → `.`, …), word-repeat collapse,
+  whitespace tidy-up, and capitalization. Configure under `[dictation.cleanup]`; filler removal
+  is off by default (it can change meaning).
+
+Short utterances aren't dropped, so quick commands work too. The recording HUD is a small
+bottom-center pill with a live waveform.
+
+Want an LLM to rewrite dictated text? Dictate it, then run a transform prompt on the
+selection (`papagaia prompt run <name>`, or bind a `pick` key to choose from the picker) —
+dictation itself stays fast and fully local.
+
+## Keybinds
+
+papagaia watches the keyboard directly (evdev) and owns all its hotkeys, so you configure
+nothing in your compositor. Set them under `[keybinds]`:
+
+```toml
+[keybinds]
+push_to_talk = "RightCtrl"   # hold to dictate, release to insert (Wispr Flow's default)
+toggle = ""                  # tap to toggle hands-free dictation
+pick = ""                    # tap to open the prompt picker
 ```
 
-Set `[dictation].post_process = true` in config to refine transcripts through your engine before typing.
+Each value is a key name (`RightCtrl`, `F13`, `Menu`, …) or a raw evdev keycode; empty means
+no hotkey for that action. This needs read access to `/dev/input` — your user must be in the
+`input` group (`papagaia doctor` checks this). Keys are *monitored*, not grabbed, so they still
+pass through to the focused app; pick keys whose passthrough is harmless (a dead key like F13,
+or RightCtrl).
 
-## Compositor Bindings
-
-Example for Niri:
-
-```kdl
-binds {
-    Mod+Shift+S { spawn "papagaia" "prompt" "run" "shorten"; }
-    Mod+Shift+G { spawn "papagaia" "prompt" "run" "fix-grammar"; }
-    Mod+Shift+D { spawn "papagaia" "dictate" "toggle"; }
-}
-```
-
-For push-to-talk, bind `dictate start` on key press and `dictate stop` on key release. Works with any Wayland compositor that can launch shell commands from shortcuts.
+To put a specific named prompt on a compositor shortcut, you can still bind
+`papagaia prompt run <name>`.
 
 ## Configuration
 
@@ -67,10 +83,11 @@ Config lives at `~/.config/papagaia/config.toml` (run `papagaia config-path` to 
 | Section | Purpose |
 |---|---|
 | `[tools]` | Clipboard read/write and copy/paste key-injection commands |
-| `[whisper]` | Speech-to-text command and model path |
-| `[dictation]` | Post-processing, streaming, context capture, audio debug |
-| `[engine]` | LLM CLI for text transformation |
-| `[[prompts]]` | Saved prompt templates and cleanup options |
+| `[whisper]` | STT backend (`cli`/`server`), model path, and warm-server command |
+| `[dictation.cleanup]` | Local rule-based transcript cleanup (voice commands, capitalization, …) |
+| `[keybinds]` | Global hotkeys watched via evdev (push_to_talk / toggle / pick) |
+| `[engine]` | LLM CLI for text transformation (the `prompt` commands) |
+| `[[prompts]]` | Saved prompt templates |
 
 ## Troubleshooting
 

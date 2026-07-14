@@ -1,6 +1,5 @@
 use std::{
     io::Write,
-    os::unix::process::CommandExt,
     process::{ChildStdin, Command, Stdio},
 };
 
@@ -62,28 +61,10 @@ fn spawn_overlay() -> Option<ChildStdin> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    // Tie the overlay's lifetime to the daemon: if the daemon exits (crash,
-    // SIGKILL, systemd restart) the kernel delivers SIGKILL to the overlay so
-    // it can't linger as an orphan. Orphans matter because they keep the
-    // layer-shell window mapped and would previously collide with fresh
-    // overlays spawned by the next daemon.
-    //
-    // SAFETY: pre_exec runs in the forked child between fork and execve. We
-    // only call async-signal-safe syscalls (prctl), so this is safe.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // Race: if the daemon died between fork and prctl, the pdeathsig
-            // never fires. Check explicitly and exit if we're already an
-            // orphan (reparented to init, ppid == 1).
-            if libc::getppid() == 1 {
-                libc::_exit(0);
-            }
-            Ok(())
-        });
-    }
+    // Tie the overlay's lifetime to the daemon so it can't linger as an orphan
+    // (which would keep the layer-shell window mapped and collide with the next
+    // daemon's overlay).
+    crate::proc::die_with_parent(&mut command);
 
     match command.spawn() {
         Ok(mut child) => {

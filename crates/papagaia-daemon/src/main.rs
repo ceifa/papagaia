@@ -1,10 +1,13 @@
 mod app;
 mod cancel;
+mod cleanup;
 mod clipboard;
 mod dictation;
+mod keybinds;
 mod llm;
 mod overlay;
-mod stream;
+mod proc;
+mod stt;
 
 use std::{fs, io::ErrorKind, os::unix::fs::FileTypeExt, path::Path, sync::Arc};
 
@@ -39,7 +42,26 @@ async fn main() -> Result<()> {
             socket_path.display()
         );
     }
+    // Resolve the keybinds before `config` is moved into the App.
+    let bindings = build_keybinds(&config.keybinds);
+
     let app = Arc::new(App::new(config).await?);
+
+    // Global hotkeys: a background evdev watcher (see `keybinds`) feeds key edges
+    // into the very same request handler the socket clients use, so there is a
+    // single state machine and one set of races to reason about.
+    if !bindings.is_empty() {
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel::<ClientRequest>();
+        let app_for_requests = app.clone();
+        tokio::spawn(async move {
+            while let Some(request) = request_rx.recv().await {
+                if let Err(error) = app_for_requests.handle(request).await {
+                    eprintln!("papagaia-daemon: keybind request failed: {error:#}");
+                }
+            }
+        });
+        keybinds::spawn(bindings, request_tx, app.busy_flag());
+    }
 
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
 
@@ -69,6 +91,26 @@ async fn main() -> Result<()> {
     // Clean up the socket file on graceful shutdown.
     let _ = fs::remove_file(&socket_path);
     Ok(())
+}
+
+/// Resolve the `[keybinds]` config into `(keycode, action)` pairs, skipping empty
+/// entries and warning on unrecognized key names.
+fn build_keybinds(config: &papagaia_core::KeybindsConfig) -> Vec<(u16, keybinds::Action)> {
+    let mut bindings = Vec::new();
+    for (key, action) in [
+        (&config.push_to_talk, keybinds::Action::PushToTalk),
+        (&config.toggle, keybinds::Action::Toggle),
+        (&config.pick, keybinds::Action::Pick),
+    ] {
+        if key.trim().is_empty() {
+            continue;
+        }
+        match papagaia_core::parse_key_name(key) {
+            Some(code) => bindings.push((code, action)),
+            None => eprintln!("papagaia: unrecognized keybind '{key}'; ignoring"),
+        }
+    }
+    bindings
 }
 
 fn prepare_socket_path(socket_path: &Path) -> Result<()> {

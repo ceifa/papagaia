@@ -1,26 +1,17 @@
 mod systemd;
 
 use std::{
-    ffi::OsStr,
     fs,
     io::ErrorKind,
-    io::{self, BufRead, BufReader, IsTerminal, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use clap_complete::{
-    CompleteEnv,
-    engine::{ArgValueCompleter, CompletionCandidate},
-    env::{Bash, EnvCompleter, Fish, Zsh},
-};
-use papagaia_core::{
-    ClientRequest, ClientResponse, Config, expand_home, overlay_program, socket_path,
-};
+use clap::{Args, Parser, Subcommand};
+use papagaia_core::{ClientRequest, ClientResponse, Config, expand_home, socket_path};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -47,42 +38,16 @@ enum Commands {
         no_backup: bool,
     },
     Doctor,
-    Dictate {
-        #[command(subcommand)]
-        command: DictateCommands,
-    },
     Restart,
     ConfigPath,
-    Completions {
-        shell: CompletionShell,
-    },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum CompletionShell {
-    Bash,
-    Zsh,
-    Fish,
 }
 
 #[derive(Debug, Subcommand)]
 #[command(disable_help_subcommand = true)]
 enum PromptCommands {
     List,
-    Run {
-        #[arg(add = ArgValueCompleter::new(complete_prompt_names))]
-        name: String,
-    },
+    Run { name: String },
     Raw(RawPromptArgs),
-    Pick,
-}
-
-#[derive(Debug, Subcommand)]
-#[command(disable_help_subcommand = true)]
-enum DictateCommands {
-    Start,
-    Stop,
-    Toggle,
 }
 
 #[derive(Debug, Args)]
@@ -91,8 +56,6 @@ struct RawPromptArgs {
     text: Option<String>,
     #[arg(long)]
     stdin: bool,
-    #[arg(long)]
-    stream_output: bool,
 }
 
 #[derive(Debug)]
@@ -103,11 +66,15 @@ struct DetectedEnvironment {
     ydotool: bool,
     ydotoold: bool,
     whisper_cli: bool,
+    whisper_server: bool,
     whisper_model: Option<PathBuf>,
     vad_model: Option<PathBuf>,
     engine_choices: Vec<EngineChoice>,
     niri: bool,
     hyprland: bool,
+    /// Whether at least one `/dev/input/event*` device is readable, i.e. whether
+    /// push-to-talk (which reads the keyboard via evdev) can work without setup.
+    input_readable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -118,19 +85,12 @@ struct EngineChoice {
 
 struct InitOptions {
     chosen_engine: Option<EngineChoice>,
-    post_process: bool,
     language: String,
+    /// Use the warm `whisper-server` backend (vs. per-call `whisper-cli`).
+    use_server: bool,
+    /// Enable hold-to-talk by default.
+    push_to_talk: bool,
 }
-
-const WHISPER_LANGUAGES: &[&str] = &[
-    "auto", "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar",
-    "sv", "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu", "ta", "no",
-    "th", "ur", "hr", "bg", "lt", "la", "mi", "ml", "cy", "sk", "te", "fa", "lv", "bn", "sr", "az",
-    "sl", "kn", "et", "mk", "br", "eu", "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw", "gl", "mr",
-    "pa", "si", "km", "sn", "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu", "am", "yi", "lo",
-    "uz", "fo", "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl", "mg", "as", "tt",
-    "haw", "ln", "ha", "ba", "jw", "su", "yue",
-];
 
 #[derive(Debug, Clone, Copy)]
 enum CheckLevel {
@@ -147,8 +107,6 @@ struct DoctorCheck {
 }
 
 fn main() -> Result<()> {
-    CompleteEnv::with_factory(Cli::command).complete();
-
     let cli = Cli::parse();
 
     match cli.command {
@@ -159,66 +117,18 @@ fn main() -> Result<()> {
         Commands::Prompt { command } => match command {
             PromptCommands::List => print_prompt_templates(),
             PromptCommands::Run { name } => {
-                print_response(send_request(&ClientRequest::Transform {
-                    prompt: name,
-                    selected_text: None,
-                    preserve_selection: false,
-                })?)
+                print_response(send_request(&ClientRequest::Transform { prompt: name })?)
             }
             PromptCommands::Raw(args) => {
                 let template = resolve_raw_prompt_text(&args)?;
-                print_response(send_request(&ClientRequest::TransformRaw {
-                    template,
-                    selected_text: None,
-                    preserve_selection: false,
-                    stream_output: args.stream_output,
-                })?)
+                print_response(send_request(&ClientRequest::TransformRaw { template })?)
             }
-            PromptCommands::Pick => run_pick(),
         },
         Commands::Init { force, no_backup } => run_init(force, no_backup),
         Commands::Doctor => run_doctor(),
         Commands::Status => print_response(status_request()?),
-        Commands::Dictate { command } => match command {
-            DictateCommands::Start => print_response(send_request(&ClientRequest::DictateStart)?),
-            DictateCommands::Stop => print_response(send_request(&ClientRequest::DictateStop)?),
-            DictateCommands::Toggle => print_response(send_request(&ClientRequest::DictateToggle)?),
-        },
         Commands::Restart => run_restart(),
-        Commands::Completions { shell } => write_completions(shell),
     }
-}
-
-fn write_completions(shell: CompletionShell) -> Result<()> {
-    let mut buf = Vec::new();
-    render_completion_script(shell, &mut buf)?;
-    io::stdout().write_all(&buf)?;
-    Ok(())
-}
-
-fn render_completion_script(shell: CompletionShell, buf: &mut Vec<u8>) -> Result<()> {
-    let completer: &dyn EnvCompleter = match shell {
-        CompletionShell::Bash => &Bash,
-        CompletionShell::Zsh => &Zsh,
-        CompletionShell::Fish => &Fish,
-    };
-    completer
-        .write_registration("COMPLETE", "papagaia", "papagaia", "papagaia", buf)
-        .context("failed to generate completion registration script")?;
-    Ok(())
-}
-
-fn complete_prompt_names(current: &OsStr) -> Vec<CompletionCandidate> {
-    let prefix = current.to_string_lossy();
-    let Ok(config) = Config::load() else {
-        return Vec::new();
-    };
-    config
-        .prompts
-        .into_iter()
-        .filter(|p| p.name.starts_with(prefix.as_ref()))
-        .map(|p| CompletionCandidate::new(p.name))
-        .collect()
 }
 
 fn print_prompt_templates() -> Result<()> {
@@ -242,107 +152,13 @@ fn print_prompt_templates() -> Result<()> {
     println!("Saved prompts ({}):", config.prompts.len());
     println!();
     for prompt in &config.prompts {
-        let summary = prompt_summary(&prompt.template);
+        let summary = papagaia_core::prompt_summary(&prompt.template);
         println!("  {:<width$}  {}", prompt.name, summary, width = name_width);
     }
     println!();
     println!("Run one with:   papagaia prompt run <name>");
     println!("Ad-hoc prompt:  papagaia prompt raw --text 'Rewrite this: {{{{text}}}}'");
-    println!("Streaming raw:  papagaia prompt raw --text 'Fix this: {{{{text}}}}' --stream-output");
-    println!("Picker raw:     typing ad-hoc text in the picker streams by default");
     Ok(())
-}
-
-fn prompt_summary(template: &str) -> String {
-    const MAX_LEN: usize = 72;
-    let first_line = template
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("");
-
-    if first_line.chars().count() <= MAX_LEN {
-        return first_line.to_string();
-    }
-
-    let truncated: String = first_line.chars().take(MAX_LEN - 1).collect();
-    format!("{truncated}…")
-}
-
-fn run_pick() -> Result<()> {
-    let config = Config::load()?;
-    let entries: Vec<serde_json::Value> = config
-        .prompts
-        .iter()
-        .map(|p| {
-            serde_json::json!({
-                "name": p.name,
-                "summary": prompt_summary(&p.template),
-            })
-        })
-        .collect();
-    let entries_json = serde_json::to_string(&entries)?;
-
-    let overlay = overlay_program();
-    let mut child = std::process::Command::new(&overlay)
-        .arg("--pick")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to launch picker at {}", overlay.display()))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(entries_json.as_bytes())?;
-    }
-
-    let output = child.wait_with_output().context("picker process failed")?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stdout = stdout.trim();
-
-    if stdout.is_empty() {
-        return Ok(());
-    }
-
-    // Give the compositor a moment to return focus to the previous window
-    // before the daemon eventually pastes the transformed output.
-    thread::sleep(Duration::from_millis(80));
-
-    let result: serde_json::Value =
-        serde_json::from_str(stdout).context("failed to parse picker result")?;
-
-    match result.get("type").and_then(|t| t.as_str()) {
-        Some("template") => {
-            let name = result
-                .get("name")
-                .and_then(|n| n.as_str())
-                .context("picker result missing 'name'")?
-                .to_string();
-            print_response(send_request(&ClientRequest::Transform {
-                prompt: name,
-                selected_text: None,
-                preserve_selection: false,
-            })?)
-        }
-        Some("raw") => {
-            let template = result
-                .get("template")
-                .and_then(|t| t.as_str())
-                .context("picker result missing 'template'")?
-                .to_string();
-            let stream_output = result
-                .get("stream-output")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            print_response(send_request(&ClientRequest::TransformRaw {
-                template,
-                selected_text: None,
-                preserve_selection: false,
-                stream_output,
-            })?)
-        }
-        _ => bail!("unexpected picker result: {stdout}"),
-    }
 }
 
 fn run_restart() -> Result<()> {
@@ -369,39 +185,15 @@ fn run_init(force: bool, no_backup: bool) -> Result<()> {
     }
 
     let environment = detect_environment();
-    let interactive = io::stdin().is_terminal();
-
     print_detection_summary(&environment);
 
-    let chosen_engine = if interactive {
-        choose_engine_interactive(&environment.engine_choices)?
-    } else {
-        environment.engine_choices.first().cloned()
-    };
-
-    let post_process = if chosen_engine.is_some() {
-        if interactive {
-            ask_yes_no(
-                "Enable post-processing of dictation through the LLM engine?",
-                true,
-            )?
-        } else {
-            true
-        }
-    } else {
-        false
-    };
-
-    let language = if interactive {
-        ask_whisper_language()?
-    } else {
-        "auto".to_string()
-    };
-
+    // Non-interactive: pick sensible defaults from what's detected. Edit the
+    // generated config afterwards to taste.
     let options = InitOptions {
-        chosen_engine,
-        post_process,
-        language,
+        chosen_engine: environment.engine_choices.first().cloned(),
+        language: "auto".to_string(),
+        use_server: environment.whisper_server && environment.whisper_model.is_some(),
+        push_to_talk: environment.input_readable,
     };
 
     let config_text = render_init_config(&environment, &options);
@@ -457,94 +249,7 @@ fn run_init(force: bool, no_backup: bool) -> Result<()> {
         }
     }
 
-    if let Err(error) = install_shell_completion() {
-        println!("Skipped shell completion install: {error:#}");
-    }
-
     println!("\nRun `papagaia doctor` next to verify commands and paths.");
-    Ok(())
-}
-
-fn install_shell_completion() -> Result<()> {
-    let Some(shell_path) = std::env::var_os("SHELL") else {
-        println!("Skipped shell completions: $SHELL is not set.");
-        return Ok(());
-    };
-    let shell_name = Path::new(&shell_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-
-    match shell_name {
-        "fish" => install_fish_completion(),
-        "bash" => append_rc_source(CompletionShell::Bash, "bash", "~/.bashrc"),
-        "zsh" => append_rc_source(CompletionShell::Zsh, "zsh", "~/.zshrc"),
-        "" => {
-            println!("Skipped shell completions: could not determine shell from $SHELL.");
-            Ok(())
-        }
-        other => {
-            println!(
-                "Skipped shell completions: `{other}` not supported. Install manually with `papagaia completions <bash|zsh|fish>`."
-            );
-            Ok(())
-        }
-    }
-}
-
-fn install_fish_completion() -> Result<()> {
-    let path = PathBuf::from(expand_home("~/.config/fish/completions/papagaia.fish"));
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let mut buf = Vec::new();
-    render_completion_script(CompletionShell::Fish, &mut buf)?;
-    fs::write(&path, &buf).with_context(|| format!("failed to write {}", path.display()))?;
-    println!("Wrote fish completions to {}", path.display());
-    Ok(())
-}
-
-fn append_rc_source(shell: CompletionShell, shell_name: &str, rc_rel: &str) -> Result<()> {
-    let rc = PathBuf::from(expand_home(rc_rel));
-    let marker = "# papagaia completions (managed by `papagaia init`)";
-    let source_line = format!("source <(papagaia completions {shell_name})");
-
-    let existing = fs::read_to_string(&rc).unwrap_or_default();
-    if existing.contains(marker) || existing.contains(&source_line) {
-        println!("Shell completions already present in {}", rc.display());
-        return Ok(());
-    }
-
-    // Verify papagaia can emit the script before touching the rc file.
-    let mut probe = Vec::new();
-    render_completion_script(shell, &mut probe)?;
-
-    if let Some(parent) = rc.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
-    let leading = if existing.is_empty() || existing.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    let block = format!("{leading}\n{marker}\n{source_line}\n");
-
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&rc)
-        .with_context(|| format!("failed to open {}", rc.display()))?;
-    file.write_all(block.as_bytes())
-        .with_context(|| format!("failed to append to {}", rc.display()))?;
-
-    println!("Appended shell completions to {}", rc.display());
-    println!(
-        "Restart your shell or run `source {}` to activate.",
-        rc.display()
-    );
     Ok(())
 }
 
@@ -561,12 +266,14 @@ fn print_detection_summary(env: &DetectedEnvironment) {
         yes_no(env.ydotool)
     );
     println!(
-        "  whisper:       {}",
-        if env.whisper_cli { "yes" } else { "no" }
+        "  whisper:       cli={}, server={}",
+        yes_no(env.whisper_cli),
+        yes_no(env.whisper_server)
     );
     if let Some(model) = &env.whisper_model {
         println!("  whisper model: {}", model.display());
     }
+    println!("  keybinds:      input readable={}", yes_no(env.input_readable));
     println!(
         "  compositor:    {}",
         if env.niri {
@@ -584,92 +291,6 @@ fn print_detection_summary(env: &DetectedEnvironment) {
         println!("  engines:       {}", names.join(", "));
     }
     println!();
-}
-
-fn choose_engine_interactive(choices: &[EngineChoice]) -> Result<Option<EngineChoice>> {
-    if choices.is_empty() {
-        println!("No LLM engines detected on PATH.");
-        println!("You will need to configure the [engine] section manually after init.\n");
-        return Ok(None);
-    }
-
-    if choices.len() == 1 {
-        if ask_yes_no(&format!("Use {} as the engine?", choices[0].name), true)? {
-            return Ok(Some(choices[0].clone()));
-        }
-        return Ok(None);
-    }
-
-    println!("Select an LLM engine:");
-    for (i, choice) in choices.iter().enumerate() {
-        println!("  [{}] {}", i + 1, choice.name);
-    }
-    println!("  [0] none (configure manually)");
-
-    loop {
-        print!("Choice [1-{}]: ", choices.len());
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let input = input.trim();
-
-        if input.is_empty() {
-            println!("Using {}.\n", choices[0].name);
-            return Ok(Some(choices[0].clone()));
-        }
-
-        if let Ok(n) = input.parse::<usize>() {
-            if n == 0 {
-                return Ok(None);
-            }
-            if n >= 1 && n <= choices.len() {
-                println!("Using {}.\n", choices[n - 1].name);
-                return Ok(Some(choices[n - 1].clone()));
-            }
-        }
-
-        println!("Please enter a number between 0 and {}.", choices.len());
-    }
-}
-
-fn ask_whisper_language() -> Result<String> {
-    loop {
-        print!("Dictation language? Enter a whisper code (e.g. en, pt, es) or 'auto' [auto]: ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let input = input.trim().to_lowercase();
-
-        if input.is_empty() {
-            return Ok("auto".to_string());
-        }
-
-        if WHISPER_LANGUAGES.contains(&input.as_str()) {
-            return Ok(input);
-        }
-
-        println!(
-            "Unknown language `{input}`. See https://github.com/ggerganov/whisper.cpp for supported codes, or use 'auto'."
-        );
-    }
-}
-
-fn ask_yes_no(question: &str, default: bool) -> Result<bool> {
-    let hint = if default { "[Y/n]" } else { "[y/N]" };
-    print!("{question} {hint} ");
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let input = input.trim().to_lowercase();
-
-    if input.is_empty() {
-        return Ok(default);
-    }
-
-    Ok(input.starts_with('y'))
 }
 
 fn run_doctor() -> Result<()> {
@@ -794,6 +415,50 @@ fn run_doctor() -> Result<()> {
         ),
     });
 
+    if matches!(config.whisper.backend, papagaia_core::WhisperBackend::Server) {
+        checks.push(DoctorCheck {
+            level: CheckLevel::Optional,
+            ok: environment.whisper_server,
+            label: "whisper-server (server backend)".into(),
+            suggestion: Some(
+                "install whisper.cpp's `whisper-server`, or set [whisper].backend = \"cli\"".into(),
+            ),
+        });
+    }
+
+    let keybinds = [
+        ("push_to_talk", &config.keybinds.push_to_talk),
+        ("toggle", &config.keybinds.toggle),
+        ("pick", &config.keybinds.pick),
+    ];
+    let configured_keybinds: Vec<(&str, &String)> = keybinds
+        .iter()
+        .filter(|(_, key)| !key.trim().is_empty())
+        .map(|(name, key)| (*name, *key))
+        .collect();
+
+    if !configured_keybinds.is_empty() {
+        checks.push(DoctorCheck {
+            level: CheckLevel::Optional,
+            ok: environment.input_readable,
+            label: "keybinds: /dev/input readable".into(),
+            suggestion: Some(
+                "add your user to the 'input' group: `sudo usermod -aG input $USER`, then re-login"
+                    .into(),
+            ),
+        });
+        for (name, key) in &configured_keybinds {
+            checks.push(DoctorCheck {
+                level: CheckLevel::Optional,
+                ok: papagaia_core::parse_key_name(key).is_some(),
+                label: format!("keybind [{name}] valid"),
+                suggestion: Some(format!(
+                    "'{key}' is not a recognized key name; try RightCtrl, F13, or Menu"
+                )),
+            });
+        }
+    }
+
     let required_total = checks
         .iter()
         .filter(|check| matches!(check.level, CheckLevel::Required))
@@ -850,6 +515,22 @@ fn run_doctor() -> Result<()> {
         yes_no(environment.ydotoold)
     );
     println!("- whisper-cli: {}", yes_no(environment.whisper_cli));
+    println!("- whisper-server: {}", yes_no(environment.whisper_server));
+    println!(
+        "- whisper backend: {}",
+        match config.whisper.backend {
+            papagaia_core::WhisperBackend::Server => "server",
+            papagaia_core::WhisperBackend::Cli => "cli",
+        }
+    );
+    let keybind = |key: &str| if key.is_empty() { "—".to_string() } else { key.to_string() };
+    println!(
+        "- keybinds: push_to_talk={}, toggle={}, pick={} (input readable={})",
+        keybind(&config.keybinds.push_to_talk),
+        keybind(&config.keybinds.toggle),
+        keybind(&config.keybinds.pick),
+        yes_no(environment.input_readable),
+    );
     println!(
         "- whisper model: {}",
         environment
@@ -950,12 +631,34 @@ fn detect_environment() -> DetectedEnvironment {
         ydotool: command_exists("ydotool"),
         ydotoold: command_exists("ydotoold"),
         whisper_cli: command_exists("whisper-cli"),
+        whisper_server: command_exists("whisper-server"),
         whisper_model: find_whisper_model(),
         vad_model: find_vad_model(),
         engine_choices: detect_engine_choices(),
         niri: command_exists("niri"),
         hyprland: command_exists("hyprctl"),
+        input_readable: input_devices_readable(),
     }
+}
+
+/// Whether any `/dev/input/event*` device can be opened for reading. Push-to-talk
+/// needs this (it reads the keyboard via evdev); it's true when the user is in the
+/// `input` group.
+fn input_devices_readable() -> bool {
+    let Ok(entries) = fs::read_dir("/dev/input") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_event_node = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("event"));
+        if is_event_node && fs::File::open(&path).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 fn render_init_config(environment: &DetectedEnvironment, options: &InitOptions) -> String {
@@ -977,24 +680,16 @@ fn render_init_config(environment: &DetectedEnvironment, options: &InitOptions) 
         .unwrap_or_else(|| {
             "# Configure this to whichever CLI you want to use for text transformation.\n".into()
         });
-    let window_title_command = if environment.niri {
-        toml_array(&["niri", "msg", "-j", "focused-window"])
-    } else if environment.hyprland {
-        toml_array(&["hyprctl", "activewindow", "-j"])
-    } else {
-        "[]".into()
-    };
-    let post_process = if options.post_process {
-        "true"
-    } else {
-        "false"
-    };
     let vad_args = environment
         .vad_model
         .as_ref()
         .map(|path| format!(r#", "--vad", "-vm", "{}""#, path.display()))
         .unwrap_or_default();
     let language = options.language.as_str();
+    let whisper_backend = if options.use_server { "server" } else { "cli" };
+    // Default the push-to-talk hotkey on only when evdev can actually read the
+    // keyboard; otherwise leave it empty so nothing silently fails.
+    let push_to_talk_key = if options.push_to_talk { "RightCtrl" } else { "" };
 
     format!(
         r#"logging = true
@@ -1010,36 +705,33 @@ clipboard_settle_ms = 120
 enabled = true
 
 [whisper]
+# backend = "server" keeps the model resident in a warm whisper-server (fast).
+# "cli" shells out to whisper-cli per call. The server path automatically falls
+# back to the cli path below when the server is unreachable.
+backend = "{whisper_backend}"
 model = "{whisper_model}"
 argv = ["whisper-cli", "-m", "{{{{model}}}}", "-f", "{{{{audio_path}}}}", "-np", "-nt", "-l", "{language}"{vad_args}, "--prompt", "Natural spoken dictation with correct punctuation, natural sentences, and no filler words."]
-capture_stdout = true
+# Warm-server backend: the daemon launches and supervises whisper-server itself.
+server_url = "http://127.0.0.1:8080"
+manage_server = true
+server_argv = ["whisper-server", "-m", "{{{{model}}}}", "--host", "127.0.0.1", "--port", "8080", "-l", "{language}"{vad_args}]
 
-[dictation]
-# Post-process dictation through the LLM engine to clean up transcription.
-# When enabled, the whisper transcript is refined by the configured [engine]
-# before being typed into the focused window.
-post_process = {post_process}
-stream_post_process = true
-post_process_template = """
-You are a voice-to-text post-processor. Your job is to turn raw speech transcription into clean, ready-to-use text.
+[dictation.cleanup]
+# Fast, local, rule-based polish applied to every transcript (no LLM).
+voice_commands = true         # "new line"/"nova linha" -> break, "period"/"ponto final" -> "."
+dedupe_repeated_words = true  # "the the" -> "the"
+collapse_whitespace = true
+capitalize_sentences = true
+remove_fillers = false        # off by default: removing filler words can change meaning
+# filler_words = ["um", "uh", "né", "tipo"]
 
-Rules:
-- Fix punctuation, capitalization, and grammar
-- Remove filler words and speech artifacts (um, uh, like, you know, so, basically, I mean, right, well, tipo, né, então)
-- Remove false starts and repeated words ("I want to I want to go" → "I want to go")
-- Interpret voice commands literally: "new line" or "nova linha" → insert a line break, "new paragraph" or "novo parágrafo" → insert two line breaks, "period" or "ponto final" → ".", "comma" or "vírgula" → ","
-- Preserve the original language — do not translate
-- Preserve the speaker's meaning, intent, and tone
-- Do not add, invent, or editorialize any content
-- Output only the cleaned text, nothing else — no preamble, no quotes, no explanation
-{{{{context}}}}
-Transcription:
-{{{{text}}}}
-"""
-# Capture the focused window title before recording starts.
-# This context is injected into the post-processing prompt via {{{{context}}}}.
-context_awareness = true
-window_title_command = {window_title_command}
+[keybinds]
+# Global hotkeys papagaia watches itself via evdev — no compositor config needed.
+# Needs read access to /dev/input (be in the 'input' group). Empty = no hotkey.
+# Pick keys whose passthrough is harmless (a dead key like F13, or RightCtrl).
+push_to_talk = "{push_to_talk_key}"   # hold to dictate, release to insert
+toggle = ""                           # tap to toggle hands-free dictation
+pick = ""                             # tap to open the prompt picker
 
 {engine_comment}# Engine fallback: repeat this section as [[engine]] tables to define a
 # chain. Each engine is tried in order; if one fails (missing binary, non-zero
@@ -1053,7 +745,6 @@ window_title_command = {window_title_command}
 [engine]
 argv = {engine_command}
 stdin = false
-capture_stdout = true
 
 [[prompts]]
 name = "shorten"
@@ -1063,7 +754,6 @@ Return only the rewritten text.
 
 {{{{text}}}}
 """
-# Optional: set stream_output = true to type text as the engine prints it.
 
 [[prompts]]
 name = "fix-grammar"
@@ -1091,10 +781,8 @@ fn preferred_input_commands(environment: &DetectedEnvironment) -> (String, Strin
     )
 }
 
-// NOTE: the model names below (gpt-5.4-mini, gemini-3.1-flash-lite-preview,
-// gpt-4.1, claude haiku, …) are baked-in `init` defaults and date quickly. They
-// only seed a fresh config — users can edit [engine].argv afterwards — but
-// revisit them when a vendor retires or renames a model.
+// NOTE: the model names below are baked-in `init` defaults that date quickly —
+// they only seed a fresh config; revisit when a vendor renames/retires a model.
 fn detect_engine_choices() -> Vec<EngineChoice> {
     let mut choices = Vec::new();
 
@@ -1438,11 +1126,13 @@ mod tests {
             ydotool: true,
             ydotoold: true,
             whisper_cli: true,
+            whisper_server: true,
             whisper_model: Some("/tmp/model.bin".into()),
             vad_model: None,
             engine_choices: vec![test_engine()],
             niri: true,
             hyprland: false,
+            input_readable: true,
         }
     }
 
@@ -1451,53 +1141,25 @@ mod tests {
         let environment = test_environment();
         let options = InitOptions {
             chosen_engine: Some(test_engine()),
-            post_process: true,
             language: "auto".into(),
+            use_server: true,
+            push_to_talk: false,
         };
 
         let config = render_init_config(&environment, &options);
         assert!(config.contains("model = \"/tmp/model.bin\""));
+        assert!(config.contains("backend = \"server\""));
+        assert!(config.contains("server_argv = [\"whisper-server\""));
+        assert!(config.contains("[dictation.cleanup]"));
+        // push_to_talk: false -> no hotkey written.
+        assert!(config.contains("[keybinds]"));
+        assert!(config.contains("push_to_talk = \"\""));
         assert!(config.contains(
             "argv = [\"codex\", \"exec\", \"-m\", \"gpt-5.4-mini\", \"--ephemeral\", \"--skip-git-repo-check\", \"-c\", \"model_reasoning_effort=none\", \"-c\", \"model_verbosity=low\", \"-c\", \"model_reasoning_summary=none\", \"-c\", \"hide_agent_reasoning=true\", \"-c\", \"model_instructions_file=\\\"~/.config/papagaia/codex_instructions.md\\\"\", \"-c\", \"sandbox_mode=read-only\", \"-c\", \"approval_policy=never\", \"-c\", \"include_environment_context=false\", \"-c\", \"skills.bundled.enabled=false\", \"--disable\", \"shell_tool\", \"--disable\", \"plugins\", \"--disable\", \"multi_agent\", \"--disable\", \"tool_suggest\", \"--disable\", \"fast_mode\", \"--disable\", \"undo\", \"{{prompt}}\"]"
         ));
-        assert!(config.contains("[dictation]"));
-        assert!(
-            config
-                .contains("window_title_command = [\"niri\", \"msg\", \"-j\", \"focused-window\"]")
-        );
-    }
-
-    #[test]
-    fn init_config_respects_post_process_option() {
-        let environment = test_environment();
-
-        let enabled = InitOptions {
-            chosen_engine: Some(test_engine()),
-            post_process: true,
-            language: "auto".into(),
-        };
-        let config = render_init_config(&environment, &enabled);
-        assert!(config.contains("post_process = true"));
-
-        let disabled = InitOptions {
-            chosen_engine: Some(test_engine()),
-            post_process: false,
-            language: "auto".into(),
-        };
-        let config = render_init_config(&environment, &disabled);
-        assert!(config.contains("post_process = false"));
-    }
-
-    #[test]
-    fn init_config_context_awareness_enabled_by_default() {
-        let environment = test_environment();
-        let options = InitOptions {
-            chosen_engine: Some(test_engine()),
-            post_process: false,
-            language: "auto".into(),
-        };
-        let config = render_init_config(&environment, &options);
-        assert!(config.contains("context_awareness = true"));
+        // The dictation LLM post-processing config was removed.
+        assert!(!config.contains("post_process"));
+        assert!(!config.contains("window_title_command"));
     }
 
     #[test]
@@ -1505,10 +1167,43 @@ mod tests {
         let environment = test_environment();
         let options = InitOptions {
             chosen_engine: None,
-            post_process: false,
             language: "auto".into(),
+            use_server: true,
+            push_to_talk: false,
         };
         let config = render_init_config(&environment, &options);
         assert!(config.contains("\"your-llm-cli\""));
+    }
+
+    #[test]
+    fn init_config_round_trips_into_a_valid_config() {
+        let environment = test_environment();
+        let options = InitOptions {
+            chosen_engine: Some(test_engine()),
+            language: "pt".into(),
+            use_server: true,
+            push_to_talk: true,
+        };
+        let rendered = render_init_config(&environment, &options);
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("papagaia-init-roundtrip-{nonce}.toml"));
+        std::fs::write(&path, &rendered).expect("write rendered config");
+
+        let parsed = papagaia_core::Config::load_from_path(&path)
+            .expect("generated init config must parse and validate");
+        std::fs::remove_file(&path).ok();
+
+        assert!(matches!(
+            parsed.whisper.backend,
+            papagaia_core::WhisperBackend::Server
+        ));
+        assert_eq!(parsed.keybinds.push_to_talk, "RightCtrl");
+        assert!(parsed.dictation.cleanup.voice_commands);
+        assert!(!parsed.dictation.cleanup.remove_fillers);
+        assert!(parsed.whisper.server_argv.iter().any(|a| a == "whisper-server"));
     }
 }

@@ -6,20 +6,14 @@ pub enum ClientRequest {
     Status,
     Transform {
         prompt: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        selected_text: Option<String>,
-        #[serde(default)]
-        preserve_selection: bool,
     },
     TransformRaw {
         template: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        selected_text: Option<String>,
-        #[serde(default)]
-        preserve_selection: bool,
-        #[serde(default)]
-        stream_output: bool,
     },
+    /// Show the prompt picker (orchestrated entirely by the daemon) and run the
+    /// chosen prompt. Replaces the old CLI-driven picker that spawned the overlay
+    /// itself and then sent a separate Transform back.
+    Pick,
     DictateStart,
     DictateStop,
     DictateToggle,
@@ -75,7 +69,6 @@ pub enum OverlayMessage {
     },
     Recording {
         level: f32,
-        transcript: Option<String>,
     },
     Result {
         ok: bool,
@@ -87,4 +80,20 @@ pub enum OverlayMessage {
     Notice {
         message: String,
     },
+}
+
+/// One row in the prompt picker, sent by the daemon to the picker overlay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PickerEntry {
+    pub name: String,
+    pub summary: String,
+}
+
+/// What the picker overlay sends back to the daemon: either a saved prompt
+/// chosen by name, or ad-hoc text typed into the search box.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum PickerResult {
+    Template { name: String },
+    Raw { template: String },
 }

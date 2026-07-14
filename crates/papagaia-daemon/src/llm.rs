@@ -1,20 +1,18 @@
 use std::path::Path;
 
-use std::future::Future;
-
 use anyhow::{Context, Result, bail};
 use papagaia_core::{EngineConfig, WhisperConfig};
 
 use crate::{
     cancel::CancelToken,
-    clipboard::{run_command, run_command_allow_exit, run_command_streaming},
+    clipboard::{run_command, run_command_allow_exit},
 };
 
 /// Run the engine chain, returning the first engine's output that succeeds.
 ///
-/// On failure the next engine is tried as a fallback. A cancellation is not a
-/// fallback trigger — it aborts the chain immediately. If every engine fails,
-/// the last error is returned.
+/// On failure the next engine is tried as a fallback; a cancellation aborts the
+/// chain immediately and is never a fallback trigger. If every engine fails, the
+/// last error is returned.
 pub async fn run_engine(
     engines: &[EngineConfig],
     prompt: &str,
@@ -25,15 +23,13 @@ pub async fn run_engine(
         match run_single_engine(engine, prompt, cancel).await {
             Ok(text) => return Ok(text),
             Err(error) => {
-                if cancel.is_cancelled() {
+                if cancel.is_cancelled() || index + 1 == engines.len() {
                     return Err(error);
                 }
-                if index + 1 < engines.len() {
-                    eprintln!(
-                        "papagaia: engine #{} failed, falling back to next: {error:#}",
-                        index + 1
-                    );
-                }
+                eprintln!(
+                    "papagaia: engine #{} failed, falling back to next: {error:#}",
+                    index + 1
+                );
                 last_error = Some(error);
             }
         }
@@ -58,40 +54,9 @@ async fn run_single_engine(
         run_command(&argv, None, cancel).await?
     };
 
-    if !engine.capture_stdout {
-        return Ok(String::new());
-    }
-
     let text =
         String::from_utf8(output.stdout).context("configured engine produced invalid UTF-8")?;
     Ok(clean_engine_output(&text))
-}
-
-pub async fn run_engine_streaming<F, Fut>(
-    engine: &EngineConfig,
-    prompt: &str,
-    cancel: &CancelToken,
-    on_stdout: F,
-) -> Result<()>
-where
-    F: FnMut(String) -> Fut,
-    Fut: Future<Output = Result<()>>,
-{
-    if engine.argv.is_empty() {
-        bail!("configured engine has no argv configured");
-    }
-
-    // Streaming hands the output to the caller through `on_stdout` as it
-    // arrives, so there's nothing useful to return here — the captured-stdout
-    // copy the non-streaming path builds would just be discarded.
-    let argv = render_argv(&engine.argv, &[("prompt", prompt)]);
-    if engine.stdin {
-        run_command_streaming(&argv, Some(prompt), cancel, on_stdout).await?;
-    } else {
-        run_command_streaming(&argv, None, cancel, on_stdout).await?;
-    }
-
-    Ok(())
 }
 
 /// Exit code whisper-cli returns when VAD detects no speech in the audio.
@@ -107,18 +72,20 @@ pub async fn run_whisper(
         .context("audio path contains non-UTF-8 data")?;
     let argv = render_argv(
         &whisper.argv,
-        &[("model", &whisper.model), ("audio_path", audio_path)],
+        &[
+            ("model", &whisper.model),
+            ("audio_path", audio_path),
+            ("prompt", &whisper.prompt),
+        ],
     );
     let output = run_command_allow_exit(&argv, cancel, &[WHISPER_EXIT_NO_SPEECH]).await?;
-    if !whisper.capture_stdout {
-        return Ok(String::new());
-    }
-
     let stdout = String::from_utf8(output.stdout).context("whisper output was not valid UTF-8")?;
     Ok(clean_whisper_output(&stdout))
 }
 
-fn render_argv(argv: &[String], vars: &[(&str, &str)]) -> Vec<String> {
+/// Substitute `{{name}}` placeholders in a command's argv. Shared by the engine,
+/// whisper-cli, and whisper-server launch commands.
+pub(crate) fn render_argv(argv: &[String], vars: &[(&str, &str)]) -> Vec<String> {
     argv.iter()
         .map(|arg| {
             let mut rendered = arg.clone();
@@ -134,14 +101,16 @@ fn clean_engine_output(output: &str) -> String {
     output.trim().to_string()
 }
 
+/// Strip whisper-cli's own noise: its `[timestamp]` log lines and blank lines.
+/// Flattening the remaining lines into one is left to `stt::normalize_transcript`
+/// so there's a single place that does whitespace flattening for both backends.
 fn clean_whisper_output(output: &str) -> String {
-    let cleaned_lines: Vec<&str> = output
+    output
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter(|line| !line.starts_with('['))
-        .collect();
-    cleaned_lines.join(" ")
+        .filter(|line| !line.is_empty() && !line.starts_with('['))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -156,7 +125,6 @@ mod tests {
         EngineConfig {
             argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
             stdin: false,
-            capture_stdout: true,
         }
     }
 
@@ -171,8 +139,10 @@ mod tests {
 
     #[test]
     fn strips_whisper_log_lines() {
+        // clean_whisper_output only drops [..] log lines + blanks; flattening the
+        // remaining lines into one is stt::normalize_transcript's job.
         let raw = "[00:00:00] loading\nhello\nworld\n";
-        assert_eq!(clean_whisper_output(raw), "hello world");
+        assert_eq!(clean_whisper_output(raw), "hello\nworld");
     }
 
     #[tokio::test]
