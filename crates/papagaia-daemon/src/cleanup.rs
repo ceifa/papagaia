@@ -171,13 +171,24 @@ fn dedupe_immediate_repeats(line: &str) -> String {
     out.join(" ")
 }
 
+/// Punctuation that always hugs the word before it. Opening marks like `(` or
+/// `¿`/`¡` are deliberately absent — they take a leading space.
+const CLOSING_PUNCT: [char; 6] = ['.', ',', '?', '!', ':', ';'];
+
 fn collapse_whitespace(text: &str) -> String {
-    // Collapse intra-line whitespace and trim each line.
-    let collapsed: String = text
-        .split('\n')
-        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Rejoin each line's words with single spaces — except before closing
+    // punctuation, which never wants one. That stray space comes from segmented
+    // whisper output: a segment starting at a "." / "," leaves "word .".
+    let collapsed = map_lines(text, |line| {
+        let mut out = String::with_capacity(line.len());
+        for word in line.split_whitespace() {
+            if !out.is_empty() && !word.starts_with(CLOSING_PUNCT) {
+                out.push(' ');
+            }
+            out.push_str(word);
+        }
+        out
+    });
 
     // Collapse runs of 3+ newlines down to a paragraph break (two newlines).
     let mut out = String::with_capacity(collapsed.len());
@@ -265,6 +276,13 @@ mod tests {
     fn collapses_extra_whitespace() {
         let out = clean(&cfg(), "a   b\t\tc");
         assert_eq!(out, "A b c");
+    }
+
+    #[test]
+    fn drops_stray_space_before_punctuation() {
+        // VAD-split whisper output leaves "word ." / "word ," — the space goes.
+        let out = clean(&cfg(), "sobe no artifact . utilize as cores , etc");
+        assert_eq!(out, "Sobe no artifact. Utilize as cores, etc");
     }
 
     #[test]

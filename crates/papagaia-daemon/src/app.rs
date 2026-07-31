@@ -15,8 +15,13 @@ use tokio::{
 };
 
 use crate::{
-    cancel::CancelToken, cleanup, clipboard, dictation::MAX_RECORDING_SECS, dictation::Recorder,
-    llm, overlay::OverlayHandle, stt, stt::WhisperServer,
+    cancel::CancelToken,
+    cleanup, clipboard,
+    dictation::{self, MAX_RECORDING_SECS, Recorder},
+    llm,
+    overlay::OverlayHandle,
+    stt,
+    stt::WhisperServer,
 };
 
 macro_rules! log {
@@ -365,7 +370,7 @@ impl App {
             let transcript = transcript.trim().to_string();
             log!(config, "[dictate] transcript: {transcript}");
             if transcript.is_empty() {
-                std::fs::remove_file(&audio_path).ok();
+                dictation::retire_recording(&config, audio_path, &transcript);
                 return Err(SoftOutcome("No speech detected".into()).into());
             }
 
@@ -385,7 +390,7 @@ impl App {
             sleep(Duration::from_millis(FOCUS_RETURN_SETTLE_MS)).await;
 
             clipboard::paste_text(&config.tools, &cleaned, &cancel).await?;
-            std::fs::remove_file(&audio_path).ok();
+            dictation::retire_recording(&config, audio_path, &transcript);
             Ok::<String, anyhow::Error>(cleaned)
         }
         .await;

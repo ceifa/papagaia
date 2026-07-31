@@ -113,3 +113,9 @@ that's missing.
 
 Set `logging = true` in the config to get verbose daemon logs (visible via
 `journalctl --user -u papagaia-daemon -f` when running under systemd).
+
+To debug transcription quality, set `[dictation].recordings_dir` (empty by default,
+so recordings are deleted as usual). Every recording is then kept there as
+`<timestamp>.wav` alongside a `<timestamp>.txt` holding its raw transcript, up to
+`recordings_keep` files. That gives you real utterances to replay against
+different `[whisper]` settings instead of guessing at flags.

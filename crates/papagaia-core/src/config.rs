@@ -89,6 +89,7 @@ impl Config {
 
     fn normalize(&mut self) {
         self.whisper.model = expand_home(&self.whisper.model);
+        self.dictation.recordings_dir = expand_home(&self.dictation.recordings_dir);
         let argv_fields = [
             &mut self.tools.read_clipboard_command,
             &mut self.tools.write_clipboard_command,
@@ -150,12 +151,31 @@ impl Default for OverlayConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DictationConfig {
     /// Local, rule-based cleanup applied to every transcript before it is typed.
     /// Fast and deterministic — no LLM involved.
     #[serde(default)]
     pub cleanup: CleanupConfig,
+    /// Debug aid: when non-empty, each recording is kept in this directory (as
+    /// `<timestamp>.wav` plus a `<timestamp>.txt` holding the raw transcript)
+    /// instead of being deleted, so real utterances can be replayed while tuning
+    /// whisper settings. Empty (the default) deletes recordings as usual.
+    #[serde(default)]
+    pub recordings_dir: String,
+    /// Cap on retained recordings; the oldest are pruned past this count.
+    #[serde(default = "default_recordings_keep")]
+    pub recordings_keep: usize,
+}
+
+impl Default for DictationConfig {
+    fn default() -> Self {
+        Self {
+            cleanup: CleanupConfig::default(),
+            recordings_dir: String::new(),
+            recordings_keep: default_recordings_keep(),
+        }
+    }
 }
 
 /// Global hotkeys papagaia watches itself (via evdev), so you don't configure
@@ -426,6 +446,10 @@ fn strip_outer_markdown_fence(text: &str) -> String {
 
 fn default_overlay_enabled() -> bool {
     true
+}
+
+fn default_recordings_keep() -> usize {
+    200
 }
 
 fn default_clipboard_settle_ms() -> u64 {

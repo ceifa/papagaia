@@ -1,5 +1,6 @@
 use std::{
-    path::PathBuf,
+    ffi::OsStr,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -12,6 +13,7 @@ use alsa::{
     pcm::{Access, Format, HwParams, PCM},
 };
 use anyhow::{Context, Result};
+use papagaia_core::Config;
 use tokio::sync::mpsc;
 
 const WHISPER_SAMPLE_RATE: u32 = 16000;
@@ -114,6 +116,88 @@ impl Recorder {
         writer.finalize()?;
 
         Ok((audio_path, duration_secs))
+    }
+}
+
+/// Dispose of a finished recording: delete it, unless `dictation.recordings_dir`
+/// is set — then archive it there first, next to a `.txt` holding the raw
+/// (pre-cleanup) transcript, so a real utterance can be replayed later against
+/// different whisper settings.
+///
+/// Archiving copies up to `MAX_RECORDING_SECS` of audio across filesystems, which
+/// would stall the current-thread runtime, so it runs on the blocking pool.
+/// Nothing awaits it: a debug aid must never delay or fail a dictation.
+pub fn retire_recording(config: &Arc<Config>, audio_path: PathBuf, transcript: &str) {
+    if config.dictation.recordings_dir.trim().is_empty() {
+        std::fs::remove_file(&audio_path).ok();
+        return;
+    }
+    let config = config.clone();
+    let transcript = transcript.to_string();
+    tokio::task::spawn_blocking(move || {
+        archive_recording(&config, &audio_path, &transcript);
+        // A successful rename already moved it; this covers the copy fallback.
+        std::fs::remove_file(&audio_path).ok();
+    });
+}
+
+fn archive_recording(config: &Config, audio_path: &Path, transcript: &str) {
+    let dir = Path::new(config.dictation.recordings_dir.trim());
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        if config.logging {
+            eprintln!(
+                "papagaia: could not create recordings dir {}: {error}",
+                dir.display()
+            );
+        }
+        return;
+    }
+
+    // Reuse the recording's own file name, so the WAV and its transcript share a
+    // stem and `prune_recordings` can sort them chronologically.
+    let name = audio_path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("recording.wav"));
+    let wav_dest = dir.join(name);
+    // `rename` fails across filesystems (the recording lives in /tmp, usually a
+    // tmpfs), so fall back to a copy.
+    if std::fs::rename(audio_path, &wav_dest).is_err()
+        && std::fs::copy(audio_path, &wav_dest).is_err()
+    {
+        if config.logging {
+            eprintln!("papagaia: could not archive {}", audio_path.display());
+        }
+        return;
+    }
+    std::fs::write(wav_dest.with_extension("txt"), format!("{transcript}\n")).ok();
+
+    prune_recordings(dir, config.dictation.recordings_keep);
+}
+
+/// Delete the oldest recordings (WAV plus its transcript) past `keep`, so an
+/// always-on debug directory can't grow without bound. `keep == 0` means no cap.
+fn prune_recordings(dir: &Path, keep: usize) {
+    if keep == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut wavs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "wav"))
+        .collect();
+    if wavs.len() <= keep {
+        return;
+    }
+    // `finish` names recordings `papagaia-<millis>.wav`, so a lexicographic sort
+    // is chronological (millisecond stamps stay the same width for centuries).
+    wavs.sort();
+    let excess = wavs.len() - keep;
+    for wav in wavs.into_iter().take(excess) {
+        std::fs::remove_file(&wav).ok();
+        std::fs::remove_file(wav.with_extension("txt")).ok();
     }
 }
 

@@ -62,10 +62,33 @@ async fn transcribe_raw(
     llm::run_whisper(whisper, audio_path, cancel).await
 }
 
-/// Collapse a transcript's inter-segment whitespace (including the newlines a
-/// VAD-splitting server inserts) into single spaces.
+/// Flatten a multi-segment transcript to a single line.
+///
+/// whisper-server writes one line per segment and wraps segments at 60 characters,
+/// so a wrap can fall inside a word — joining those lines with a space is what
+/// turns "enviar" into "env iar". Whisper's own spacing says where the words are:
+/// a segment beginning a new word starts with a space, one continuing the previous
+/// word does not. Join on that signal rather than on the newline.
 fn normalize_transcript(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(text.len());
+    for segment in text.split('\n') {
+        // Skip blank segments (the trailing newline leaves one) so they can't
+        // strand a separator space with no word after it.
+        if segment.trim().is_empty() {
+            continue;
+        }
+        if !out.is_empty() && segment.starts_with(char::is_whitespace) {
+            out.push(' ');
+        }
+        // Appending word by word also collapses whitespace runs inside a segment.
+        for (index, word) in segment.split_whitespace().enumerate() {
+            if index > 0 {
+                out.push(' ');
+            }
+            out.push_str(word);
+        }
+    }
+    out
 }
 
 /// A handle to the warm whisper-server: the endpoint to POST to, plus (when
@@ -236,8 +259,10 @@ fn post_inference(endpoint: &Endpoint, wav: &[u8]) -> Result<String> {
 }
 
 /// Build a `multipart/form-data` body: the WAV under field `file`, plus
-/// `response_format=json` so the reply is always `{"text": ...}`, and a fixed
-/// temperature for deterministic output.
+/// `response_format=json` so the reply is always `{"text": ...}`, a fixed
+/// temperature for deterministic output, and `split_on_word` so the server's
+/// 60-character segment wrapping (hardcoded whenever `max_len` is unset) lands
+/// between words instead of inside one.
 fn build_multipart_body(boundary: &str, wav: &[u8]) -> Vec<u8> {
     let mut body = Vec::with_capacity(wav.len() + 512);
     body.extend_from_slice(
@@ -254,6 +279,7 @@ fn build_multipart_body(boundary: &str, wav: &[u8]) -> Vec<u8> {
         format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n\
              --{boundary}\r\nContent-Disposition: form-data; name=\"temperature\"\r\n\r\n0.0\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"split_on_word\"\r\n\r\ntrue\r\n\
              --{boundary}--\r\n"
         )
         .as_bytes(),
@@ -324,6 +350,7 @@ mod tests {
         assert!(text.contains("name=\"file\"; filename=\"audio.wav\""));
         assert!(text.contains("RIFFdata"));
         assert!(text.contains("name=\"response_format\""));
+        assert!(text.contains("name=\"split_on_word\"\r\n\r\ntrue"));
         assert!(text.contains("--BOUND--\r\n"));
     }
 
@@ -334,6 +361,32 @@ mod tests {
             "Cara, então, sobre Isso. Eu não gostei."
         );
         assert_eq!(normalize_transcript("  single   line  "), "single line");
+    }
+
+    #[test]
+    fn normalize_transcript_rejoins_word_split_across_segments() {
+        // Real whisper-server output: its 60-character segment wrap landed inside
+        // "enviar", so the next segment carries no leading space. Joining on the
+        // newline would type "env iar".
+        assert_eq!(
+            normalize_transcript(" o usuário vai env\niar um arquivo\n"),
+            "o usuário vai enviar um arquivo"
+        );
+        // Same, with the continuation carrying the sentence's final punctuation.
+        assert_eq!(
+            normalize_transcript(" ele vai acordando e continu\nando.\n"),
+            "ele vai acordando e continuando."
+        );
+    }
+
+    #[test]
+    fn normalize_transcript_keeps_space_when_segment_starts_a_word() {
+        // A leading space on the next segment marks a real word boundary — those
+        // words must not be glued together.
+        assert_eq!(
+            normalize_transcript(" para ser melhorado\n e pensa em novas\n"),
+            "para ser melhorado e pensa em novas"
+        );
     }
 
     #[test]
