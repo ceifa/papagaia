@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "papagaia-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "papagaia-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "papagaia-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "alsa",
  "anyhow",
@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "papagaia-overlay"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "futures-channel",
