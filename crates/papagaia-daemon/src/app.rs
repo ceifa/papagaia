@@ -5,8 +5,8 @@ use std::sync::{
 
 use anyhow::{Context, Result, bail};
 use papagaia_core::{
-    ClientRequest, ClientResponse, Config, OverlayMessage, PickerEntry, PickerResult, PromptConfig,
-    overlay_program, template_needs_selection,
+    ClientRequest, ClientResponse, Config, DictationTarget, OverlayMessage, PickerEntry,
+    PickerResult, PromptConfig, overlay_program, template_needs_selection,
 };
 use tokio::{
     sync::{Mutex, mpsc},
@@ -138,7 +138,7 @@ impl App {
             ClientRequest::TransformRaw { template } => self.transform_raw(&template).await,
             ClientRequest::Pick => self.pick().await,
             ClientRequest::DictateStart => self.dictate_start().await,
-            ClientRequest::DictateStop { prompt } => self.dictate_stop(prompt).await,
+            ClientRequest::DictateStop { to } => self.dictate_stop(to).await,
             ClientRequest::DictateToggle => self.dictate_toggle().await,
             ClientRequest::Cancel => self.cancel().await,
         }
@@ -150,12 +150,8 @@ impl App {
     }
 
     async fn transform_raw(&self, template: &str) -> Result<ClientResponse> {
-        let prompt = PromptConfig {
-            name: "ad-hoc".into(),
-            template: template.into(),
-            ..PromptConfig::default()
-        };
-        self.run_transform(prompt, "engine output").await
+        self.run_transform(ad_hoc(template.into()), "engine output")
+            .await
     }
 
     /// Show the prompt picker and run whatever the user chooses. The daemon owns
@@ -172,6 +168,25 @@ impl App {
     }
 
     async fn pick_inner(&self) -> Result<ClientResponse> {
+        let Some(prompt) = self.choose_prompt().await? else {
+            return Ok(ClientResponse::ok("picker cancelled"));
+        };
+
+        // Let the compositor return focus to the previous window before the
+        // transform grabs the selection / pastes into it.
+        sleep(Duration::from_millis(FOCUS_RETURN_SETTLE_MS)).await;
+
+        let label = if prompt.name == AD_HOC {
+            "engine output".to_string()
+        } else {
+            prompt.name.clone()
+        };
+        self.run_transform(prompt, &label).await
+    }
+
+    /// Show the picker: a saved prompt, an ad-hoc one typed into it, or `None`
+    /// when dismissed.
+    async fn choose_prompt(&self) -> Result<Option<PromptConfig>> {
         let config = self.config();
         let entries: Vec<PickerEntry> = config
             .prompts
@@ -181,20 +196,12 @@ impl App {
                 summary: prompt.summary(),
             })
             .collect();
-        let entries_json = serde_json::to_string(&entries)?;
-
-        let Some(choice) = run_picker(&entries_json).await? else {
-            return Ok(ClientResponse::ok("picker cancelled"));
+        let prompt = match run_picker(&serde_json::to_string(&entries)?).await? {
+            None => None,
+            Some(PickerResult::Template { name }) => Some(config.prompt(&name)?.clone()),
+            Some(PickerResult::Raw { template }) => Some(ad_hoc(template)),
         };
-
-        // Let the compositor return focus to the previous window before the
-        // transform grabs the selection / pastes into it.
-        sleep(Duration::from_millis(FOCUS_RETURN_SETTLE_MS)).await;
-
-        match choice {
-            PickerResult::Template { name } => self.transform(&name).await,
-            PickerResult::Raw { template } => self.transform_raw(&template).await,
-        }
+        Ok(prompt)
     }
 
     /// Run one prompt on the selection. Owns the whole pipeline: busy state,
@@ -349,11 +356,8 @@ impl App {
         Ok(ClientResponse::ok("dictation started"))
     }
 
-    async fn dictate_stop(&self, prompt: Option<String>) -> Result<ClientResponse> {
+    async fn dictate_stop(&self, to: Option<DictationTarget>) -> Result<ClientResponse> {
         let config = self.config();
-        let prompt = prompt
-            .map(|name| config.prompt(&name).cloned())
-            .transpose()?;
         let cancel = CancelToken::new();
         let (recorder, overlay_epoch) = {
             let mut state = self.state.lock().await;
@@ -411,32 +415,39 @@ impl App {
             let cleaned = cleanup::clean(&config.dictation.cleanup, &transcript);
             log!(config, "[dictate] cleaned: {cleaned}");
 
-            let label = match &prompt {
-                Some(prompt) => format!("Running {}", prompt.name),
-                None => "Typing".into(),
+            dictation::retire_recording(&config, audio_path, &transcript);
+
+            let (prompt, label) = match to {
+                None => (PromptConfig::default(), "Typing".to_string()),
+                Some(DictationTarget::Prompt { name }) => {
+                    let prompt = config.prompt(&name)?.clone();
+                    let label = format!("Running {name}");
+                    (prompt, label)
+                }
+                Some(DictationTarget::Picker) => {
+                    // The picker needs the keyboard the HUD is grabbing.
+                    self.overlay.send(OverlayMessage::Hidden).await;
+                    let Some(prompt) = self.choose_prompt().await? else {
+                        clipboard::copy_text(&config.tools, &cleaned, &cancel).await?;
+                        return Err(SoftOutcome("Dictation copied to the clipboard".into()).into());
+                    };
+                    let label = format!("Running {}", prompt.name);
+                    (prompt, label)
+                }
             };
             let text = self
-                .apply_prompt(
-                    prompt.as_ref().unwrap_or(&PromptConfig::default()),
-                    Some(&cleaned),
-                    &label,
-                    &cancel,
-                )
+                .apply_prompt(&prompt, Some(&cleaned), &label, &cancel)
                 .await?;
-            dictation::retire_recording(&config, audio_path, &transcript);
-            Ok::<String, anyhow::Error>(text)
+            Ok::<_, anyhow::Error>((text, prompt))
         }
         .await;
 
         self.leave_busy(overlay_epoch).await;
 
         match outcome {
-            Ok(text) => {
+            Ok((text, prompt)) => {
                 log!(config, "[dictate] inserted: {text}");
-                let msg = prompt
-                    .as_ref()
-                    .and_then(sent_message)
-                    .unwrap_or_else(|| "Dictation inserted".into());
+                let msg = sent_message(&prompt).unwrap_or_else(|| "Dictation inserted".into());
                 self.flash_result(overlay_epoch, true, msg).await;
                 Ok(ClientResponse::with_text("dictation complete", text))
             }
@@ -618,6 +629,16 @@ impl App {
 
     fn is_current_overlay_epoch(&self, overlay_epoch: u64) -> bool {
         self.overlay_epoch.load(Ordering::Acquire) == overlay_epoch
+    }
+}
+
+const AD_HOC: &str = "ad-hoc";
+
+fn ad_hoc(template: String) -> PromptConfig {
+    PromptConfig {
+        name: AD_HOC.into(),
+        template,
+        ..PromptConfig::default()
     }
 }
 

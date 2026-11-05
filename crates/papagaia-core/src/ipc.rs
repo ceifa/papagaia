@@ -15,14 +15,22 @@ pub enum ClientRequest {
     /// itself and then sent a separate Transform back.
     Pick,
     DictateStart,
-    /// `prompt` sends the transcript through that saved prompt instead of
-    /// typing it.
+    /// `to` sends the transcript somewhere other than the focused app.
     DictateStop {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        prompt: Option<String>,
+        to: Option<DictationTarget>,
     },
     DictateToggle,
     Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum DictationTarget {
+    /// A saved prompt, by name.
+    Prompt { name: String },
+    /// Whatever the user picks in the prompt picker.
+    Picker,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

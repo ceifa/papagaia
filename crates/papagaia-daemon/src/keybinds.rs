@@ -11,7 +11,8 @@
 //! Push-to-talk, pick and dictate-key edges go through one chord thread first,
 //! which tells a hold from a double-tap lock and decides what a combination
 //! means: a dictate key overlapping a dictation routes it to that key's prompt,
-//! and the pick key only opens the picker when no dictation overlapped it.
+//! and the pick key to the picker — on its own, the pick key opens the picker
+//! for the selection.
 
 use std::{
     collections::HashSet,
@@ -26,7 +27,7 @@ use std::{
 };
 
 use evdev::{Device, EventType, KeyCode};
-use papagaia_core::ClientRequest;
+use papagaia_core::{ClientRequest, DictationTarget};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// How often to rescan `/dev/input` so newly plugged keyboards are picked up.
@@ -237,15 +238,15 @@ fn chord_loop(
 #[derive(Debug, Default)]
 struct Chords {
     gesture: Gesture,
-    /// The prompt of the dictate key held right now.
-    held: Option<String>,
-    /// The prompt the dictation in progress goes to.
-    route: Option<String>,
+    /// Where the pick or dictate key held right now would send a dictation.
+    held: Option<DictationTarget>,
+    /// Where the dictation in progress goes.
+    route: Option<DictationTarget>,
     pick: PickKey,
 }
 
-/// The pick key fires on release, and only for a press no dictation overlapped,
-/// so it can share a key with a dictate key.
+/// On its own, the pick key opens the picker on release, and only for a press
+/// no dictation overlapped.
 #[derive(Debug, Default, PartialEq)]
 enum PickKey {
     #[default]
@@ -268,17 +269,8 @@ impl Chords {
                 let request = self.gesture.release(now);
                 self.routed(request)
             }
-            Key::Dictate(prompt, true) => {
-                if self.gesture.recording() {
-                    self.route = Some(prompt.clone());
-                }
-                self.held = Some(prompt);
-                None
-            }
-            Key::Dictate(prompt, false) => {
-                if self.held.as_ref() == Some(&prompt) {
-                    self.held = None;
-                }
+            Key::Dictate(name, down) => {
+                self.target(DictationTarget::Prompt { name }, down);
                 None
             }
             Key::Pick(true) => {
@@ -289,13 +281,28 @@ impl Chords {
                         PickKey::Armed
                     };
                 }
+                self.target(DictationTarget::Picker, true);
                 None
             }
             Key::Pick(false) => {
+                self.target(DictationTarget::Picker, false);
                 let armed = std::mem::take(&mut self.pick) == PickKey::Armed;
                 (armed && !busy).then_some(ClientRequest::Pick)
             }
         }
+    }
+
+    fn target(&mut self, target: DictationTarget, down: bool) {
+        if !down {
+            if self.held.as_ref() == Some(&target) {
+                self.held = None;
+            }
+            return;
+        }
+        if self.gesture.recording() {
+            self.route = Some(target.clone());
+        }
+        self.held = Some(target);
     }
 
     fn expire(&mut self) -> Option<ClientRequest> {
@@ -303,7 +310,7 @@ impl Chords {
         self.routed(request)
     }
 
-    /// A dictation takes the dictate key held when it starts, and ends with the
+    /// A dictation takes the target key held when it starts, and ends with the
     /// last one pressed during it.
     fn routed(&mut self, request: Option<ClientRequest>) -> Option<ClientRequest> {
         match request {
@@ -312,7 +319,7 @@ impl Chords {
                 request
             }
             Some(ClientRequest::DictateStop { .. }) => Some(ClientRequest::DictateStop {
-                prompt: self.route.take(),
+                to: self.route.take(),
             }),
             other => other,
         }
@@ -364,7 +371,7 @@ impl Gesture {
             }
             Gesture::Locked => {
                 *self = Gesture::Spent;
-                Some(ClientRequest::DictateStop { prompt: None })
+                Some(ClientRequest::DictateStop { to: None })
             }
             Gesture::Held { .. } | Gesture::SecondPress { .. } | Gesture::Spent => None,
         }
@@ -382,7 +389,7 @@ impl Gesture {
             }
             Gesture::Held { .. } | Gesture::SecondPress { .. } => {
                 *self = Gesture::Idle;
-                Some(ClientRequest::DictateStop { prompt: None })
+                Some(ClientRequest::DictateStop { to: None })
             }
             Gesture::Spent => {
                 *self = Gesture::Idle;
@@ -408,7 +415,7 @@ impl Gesture {
         match *self {
             Gesture::Tapped { .. } => {
                 *self = Gesture::Idle;
-                Some(ClientRequest::DictateStop { prompt: None })
+                Some(ClientRequest::DictateStop { to: None })
             }
             _ => None,
         }
@@ -440,13 +447,19 @@ mod tests {
     use super::*;
     use ClientRequest::{DictateStart, Pick};
 
-    const STOP: ClientRequest = ClientRequest::DictateStop { prompt: None };
+    const STOP: ClientRequest = ClientRequest::DictateStop { to: None };
 
     fn stop_to(prompt: &str) -> Option<ClientRequest> {
         Some(ClientRequest::DictateStop {
-            prompt: Some(prompt.into()),
+            to: Some(DictationTarget::Prompt {
+                name: prompt.into(),
+            }),
         })
     }
+
+    const STOP_TO_PICKER: Option<ClientRequest> = Some(ClientRequest::DictateStop {
+        to: Some(DictationTarget::Picker),
+    });
 
     /// Feed `keys` half a second apart (no taps) to fresh `Chords`, returning what each one sent.
     fn play(keys: &[Key]) -> Vec<Option<ClientRequest>> {
@@ -535,35 +548,25 @@ mod tests {
     #[test]
     fn a_dictate_key_pressed_during_a_hold_routes_the_dictation_to_its_prompt() {
         use Key::Talk;
-        let sent = play(&[
-            Talk(true),
-            Key::Pick(true),
-            agent(true),
-            Key::Pick(false),
-            agent(false),
-            Talk(false),
-        ]);
-        assert_eq!(
-            sent,
-            [Some(DictateStart), None, None, None, None, stop_to("Agent")]
-        );
+        let sent = play(&[Talk(true), agent(true), agent(false), Talk(false)]);
+        assert_eq!(sent, [Some(DictateStart), None, None, stop_to("Agent")]);
     }
 
     #[test]
     fn a_dictate_key_held_before_push_to_talk_also_routes() {
         use Key::Talk;
-        let sent = play(&[
-            Key::Pick(true),
-            agent(true),
-            Talk(true),
-            Talk(false),
-            Key::Pick(false),
-            agent(false),
-        ]);
-        assert_eq!(
-            sent,
-            [None, None, Some(DictateStart), stop_to("Agent"), None, None]
-        );
+        let sent = play(&[agent(true), Talk(true), Talk(false), agent(false)]);
+        assert_eq!(sent, [None, Some(DictateStart), stop_to("Agent"), None]);
+    }
+
+    #[test]
+    fn the_pick_key_during_a_dictation_sends_it_to_the_picker_without_opening_it_twice() {
+        use Key::{Pick as PickKey, Talk};
+        let during = play(&[Talk(true), PickKey(true), PickKey(false), Talk(false)]);
+        assert_eq!(during, [Some(DictateStart), None, None, STOP_TO_PICKER]);
+
+        let before = play(&[PickKey(true), Talk(true), Talk(false), PickKey(false)]);
+        assert_eq!(before, [None, Some(DictateStart), STOP_TO_PICKER, None]);
     }
 
     #[test]
