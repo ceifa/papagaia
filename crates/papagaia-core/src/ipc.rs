@@ -86,12 +86,6 @@ pub enum OverlayMessage {
     Hidden,
     Busy {
         label: String,
-        /// When true, the overlay grabs keyboard focus exclusively so the user
-        /// can press Esc to cancel. Must only be set during phases where the
-        /// daemon is not about to drive a foreign window via wtype/wl-copy
-        /// (those need keyboard focus in the target application, not the HUD).
-        #[serde(default)]
-        grab_keyboard: bool,
     },
     Recording {
         level: f32,

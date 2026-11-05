@@ -32,9 +32,8 @@ macro_rules! log {
     };
 }
 
-/// After releasing the overlay's keyboard grab, wait for the compositor to return
-/// focus to the target window before driving it with wtype — else the paste lands
-/// on the overlay.
+/// After the picker closes, wait for the compositor to return focus to the target
+/// window before driving it with wtype — else the paste lands on the picker.
 const FOCUS_RETURN_SETTLE_MS: u64 = 80;
 
 /// How long the overlay lingers on a result before hiding.
@@ -175,10 +174,6 @@ impl App {
             return Ok(ClientResponse::ok("picker cancelled"));
         };
 
-        // Let the compositor return focus to the previous window before the
-        // transform grabs the selection / pastes into it.
-        sleep(Duration::from_millis(FOCUS_RETURN_SETTLE_MS)).await;
-
         let label = if prompt.name == AD_HOC {
             "engine output".to_string()
         } else {
@@ -199,7 +194,11 @@ impl App {
                 summary: prompt.summary(),
             })
             .collect();
-        let prompt = match run_picker(&serde_json::to_string(&entries)?).await? {
+        let choice = run_picker(&serde_json::to_string(&entries)?).await?;
+        if choice.is_some() {
+            sleep(Duration::from_millis(FOCUS_RETURN_SETTLE_MS)).await;
+        }
+        let prompt = match choice {
             None => None,
             Some(PickerResult::Template { name }) => Some(config.prompt(&name)?.clone()),
             Some(PickerResult::Raw { template }) => Some(ad_hoc(template)),
@@ -225,11 +224,9 @@ impl App {
         let outcome: Result<(String, bool)> = async {
             let label = format!("Running {}", prompt.name);
 
-            // Capture phase: wtype needs the original window focused — no grab.
             overlay
                 .send(OverlayMessage::Busy {
                     label: label.clone(),
-                    grab_keyboard: false,
                 })
                 .await;
             let required = !prompt.uses_engine() || template_needs_selection(&prompt.template);
@@ -277,14 +274,12 @@ impl App {
         cancel: &CancelToken,
     ) -> Result<String> {
         let config = self.config();
+        self.overlay
+            .send(OverlayMessage::Busy {
+                label: label.into(),
+            })
+            .await;
         let text = if prompt.uses_engine() {
-            // Engine phase: grab the keyboard so Esc cancels the engine.
-            self.overlay
-                .send(OverlayMessage::Busy {
-                    label: label.into(),
-                    grab_keyboard: true,
-                })
-                .await;
             let rendered = match input {
                 Some(text) => prompt.render(text),
                 None => prompt.template.clone(),
@@ -295,16 +290,7 @@ impl App {
             input.context("no text to send")?.to_string()
         };
 
-        // Release the grab: a paste needs focus back in the target window, and a
-        // slow output command must not hold the keyboard.
-        self.overlay
-            .send(OverlayMessage::Busy {
-                label: label.into(),
-                grab_keyboard: false,
-            })
-            .await;
         if prompt.output.is_empty() {
-            sleep(Duration::from_millis(FOCUS_RETURN_SETTLE_MS)).await;
             clipboard::paste_text(&config.tools, &text, cancel).await?;
         } else if let Err(error) = clipboard::run_command(&prompt.output, Some(&text), cancel).await
         {
@@ -407,12 +393,9 @@ impl App {
             (session.recorder, overlay_epoch, to)
         };
 
-        // Transcribe phase: whisper reads the WAV file, no foreign focus needed,
-        // so grab the keyboard exclusively to let the user press Esc to cancel.
         self.overlay
             .send(OverlayMessage::Busy {
                 label: "Transcribing".into(),
-                grab_keyboard: true,
             })
             .await;
 
@@ -450,7 +433,7 @@ impl App {
                     (prompt, label)
                 }
                 Some(DictationTarget::Picker) => {
-                    // The picker needs the keyboard the HUD is grabbing.
+                    // The picker takes the place of the HUD.
                     self.overlay.send(OverlayMessage::Hidden).await;
                     let Some(prompt) = self.choose_prompt().await? else {
                         clipboard::copy_text(&config.tools, &cleaned, &cancel).await?;
