@@ -266,6 +266,11 @@ pub struct WhisperConfig {
     /// via the `{{prompt}}` placeholder so the text lives in one place.
     #[serde(default = "default_whisper_prompt")]
     pub prompt: String,
+    /// Names and terms whisper should spell right (people, products, jargon),
+    /// appended to `prompt` in `{{prompt}}`. whisper keeps only the last ~220
+    /// tokens of its prompt, so a long list pushes `prompt` itself out.
+    #[serde(default)]
+    pub vocabulary: Vec<String>,
     #[serde(default = "default_whisper_argv")]
     pub argv: Vec<String>,
     /// Base URL of the whisper-server used by the `server` backend.
@@ -287,10 +292,29 @@ impl Default for WhisperConfig {
             backend: WhisperBackend::default(),
             model: default_whisper_model(),
             prompt: default_whisper_prompt(),
+            vocabulary: Vec::new(),
             argv: default_whisper_argv(),
             server_url: default_whisper_server_url(),
             manage_server: true,
             server_argv: default_whisper_server_argv(),
+        }
+    }
+}
+
+impl WhisperConfig {
+    /// What `{{prompt}}` expands to: `prompt`, then the vocabulary terms.
+    pub fn initial_prompt(&self) -> String {
+        let terms: Vec<&str> = self
+            .vocabulary
+            .iter()
+            .map(|term| term.trim())
+            .filter(|term| !term.is_empty())
+            .collect();
+        let prompt = self.prompt.trim();
+        match (prompt.is_empty(), terms.is_empty()) {
+            (_, true) => prompt.to_string(),
+            (true, false) => format!("{}.", terms.join(", ")),
+            (false, false) => format!("{prompt} {}.", terms.join(", ")),
         }
     }
 }
@@ -634,6 +658,25 @@ mod tests {
                 "{name} should not duplicate the literal prompt text"
             );
         }
+    }
+
+    #[test]
+    fn vocabulary_is_appended_to_the_initial_prompt() {
+        let mut whisper = WhisperConfig {
+            prompt: "Natural dictation.".into(),
+            vocabulary: vec!["Papagaia".into(), " ".into(), " niri ".into()],
+            ..WhisperConfig::default()
+        };
+        assert_eq!(
+            whisper.initial_prompt(),
+            "Natural dictation. Papagaia, niri."
+        );
+
+        whisper.prompt.clear();
+        assert_eq!(whisper.initial_prompt(), "Papagaia, niri.");
+
+        whisper.vocabulary.clear();
+        assert_eq!(whisper.initial_prompt(), "");
     }
 
     #[test]

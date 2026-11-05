@@ -91,6 +91,22 @@ fn normalize_transcript(text: &str) -> String {
     out
 }
 
+/// Shortest prompt recital treated as an echo; a term or two said alone is real.
+const MIN_ECHO_WORDS: usize = 3;
+
+/// Whisper answers silence or noise by reciting its initial prompt. A transcript
+/// that is nothing but a run of the prompt's words is that echo, not dictation.
+pub fn echoes_prompt(transcript: &str, prompt: &str) -> bool {
+    fn words(text: &str) -> Vec<String> {
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
+            .collect()
+    }
+    let heard = words(transcript);
+    heard.len() >= MIN_ECHO_WORDS && words(prompt).windows(heard.len()).any(|run| run == heard)
+}
+
 /// A handle to the warm whisper-server: the endpoint to POST to, plus (when
 /// `manage_server` is set) a supervisor thread keeping the child alive.
 pub struct WhisperServer {
@@ -114,7 +130,10 @@ impl WhisperServer {
         if whisper.manage_server {
             let argv = llm::render_argv(
                 &whisper.server_argv,
-                &[("model", &whisper.model), ("prompt", &whisper.prompt)],
+                &[
+                    ("model", &whisper.model),
+                    ("prompt", &whisper.initial_prompt()),
+                ],
             );
             spawn_supervisor(argv);
         }
@@ -324,6 +343,30 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recited_prompt_is_an_echo() {
+        let prompt = "Natural dictation, correct punctuation. Ask Wai, Waizer, Blip, Samara.";
+        assert!(echoes_prompt(
+            "Natural dictation, correct punctuation.",
+            prompt
+        ));
+        assert!(echoes_prompt("ask wai waizer blip", prompt));
+        assert!(echoes_prompt("Waizer, Blip, Samara.", prompt));
+    }
+
+    #[test]
+    fn real_dictation_is_not_an_echo() {
+        let prompt = "Natural dictation, correct punctuation. Ask Wai, Waizer, Blip, Samara.";
+        // Terms said alone or out of order are dictation.
+        assert!(!echoes_prompt("Ask Wai", prompt));
+        assert!(!echoes_prompt("Blip Waizer Samara", prompt));
+        assert!(!echoes_prompt(
+            "Ask Wai, Waizer, Blip, Samara and more.",
+            prompt
+        ));
+        assert!(!echoes_prompt("", prompt));
+    }
 
     #[test]
     fn endpoint_parses_url_with_port() {
