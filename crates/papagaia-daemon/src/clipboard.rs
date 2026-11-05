@@ -44,6 +44,10 @@ pub async fn paste_text(tools: &ToolConfig, text: &str, cancel: &CancelToken) ->
     Ok(())
 }
 
+pub async fn copy_text(tools: &ToolConfig, text: &str, cancel: &CancelToken) -> Result<()> {
+    write_clipboard_text(tools, text, ClipboardWriteMode::Default, cancel).await
+}
+
 pub async fn run_command(
     argv: &[String],
     stdin_text: Option<&str>,

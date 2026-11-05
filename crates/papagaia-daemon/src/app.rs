@@ -6,7 +6,7 @@ use std::sync::{
 use anyhow::{Context, Result, bail};
 use papagaia_core::{
     ClientRequest, ClientResponse, Config, OverlayMessage, PickerEntry, PickerResult, PromptConfig,
-    overlay_program, prompt_summary, template_needs_selection,
+    overlay_program, template_needs_selection,
 };
 use tokio::{
     sync::{Mutex, mpsc},
@@ -138,7 +138,7 @@ impl App {
             ClientRequest::TransformRaw { template } => self.transform_raw(&template).await,
             ClientRequest::Pick => self.pick().await,
             ClientRequest::DictateStart => self.dictate_start().await,
-            ClientRequest::DictateStop => self.dictate_stop().await,
+            ClientRequest::DictateStop { prompt } => self.dictate_stop(prompt).await,
             ClientRequest::DictateToggle => self.dictate_toggle().await,
             ClientRequest::Cancel => self.cancel().await,
         }
@@ -153,6 +153,7 @@ impl App {
         let prompt = PromptConfig {
             name: "ad-hoc".into(),
             template: template.into(),
+            ..PromptConfig::default()
         };
         self.run_transform(prompt, "engine output").await
     }
@@ -177,7 +178,7 @@ impl App {
             .iter()
             .map(|prompt| PickerEntry {
                 name: prompt.name.clone(),
-                summary: prompt_summary(&prompt.template),
+                summary: prompt.summary(),
             })
             .collect();
         let entries_json = serde_json::to_string(&entries)?;
@@ -196,9 +197,9 @@ impl App {
         }
     }
 
-    /// Run one prompt through the engine and insert the result. Owns the whole
-    /// pipeline: busy state, selection capture, engine, paste, and overlay
-    /// feedback — one linear flow, like `dictate_stop`.
+    /// Run one prompt on the selection. Owns the whole pipeline: busy state,
+    /// selection capture, `apply_prompt`, and overlay feedback — one linear flow,
+    /// like `dictate_stop`.
     async fn run_transform(
         &self,
         prompt: PromptConfig,
@@ -221,35 +222,13 @@ impl App {
                     grab_keyboard: false,
                 })
                 .await;
-            let selected = resolve_selected_text(&config.tools, &prompt.template, &cancel).await?;
-
-            // Engine phase: grab the keyboard so Esc cancels the engine.
-            overlay
-                .send(OverlayMessage::Busy {
-                    label: label.clone(),
-                    grab_keyboard: true,
-                })
-                .await;
-
-            let rendered = match &selected {
-                Some(text) => prompt.render(text),
-                None => prompt.template.clone(),
-            };
+            let required = !prompt.uses_engine() || template_needs_selection(&prompt.template);
+            let selected = resolve_selected_text(&config.tools, required, &cancel).await?;
             log!(config, "[transform] selected={}", selected.is_some());
 
-            let raw = llm::run_engine(&config.engine, &rendered, &cancel).await?;
-            let output = prompt.clean_output(&raw);
-
-            // Paste phase: release the grab so focus returns before wtype pastes.
-            overlay
-                .send(OverlayMessage::Busy {
-                    label,
-                    grab_keyboard: false,
-                })
-                .await;
-            sleep(Duration::from_millis(FOCUS_RETURN_SETTLE_MS)).await;
-            clipboard::paste_text(&config.tools, &output, &cancel).await?;
-
+            let output = self
+                .apply_prompt(&prompt, selected.as_deref(), &label, &cancel)
+                .await?;
             log!(config, "[transform] final output: {output}");
             Ok((output, selected.is_some()))
         }
@@ -259,7 +238,9 @@ impl App {
 
         match outcome {
             Ok((text, had_selection)) => {
-                let msg = if had_selection {
+                let msg = if let Some(sent) = sent_message(&prompt) {
+                    sent
+                } else if had_selection {
                     format!("Replaced selection with {success_label}")
                 } else {
                     format!("Pasted {success_label}")
@@ -275,6 +256,53 @@ impl App {
                 Err(error)
             }
         }
+    }
+
+    /// `input` is the selection or a transcript.
+    async fn apply_prompt(
+        &self,
+        prompt: &PromptConfig,
+        input: Option<&str>,
+        label: &str,
+        cancel: &CancelToken,
+    ) -> Result<String> {
+        let config = self.config();
+        let text = if prompt.uses_engine() {
+            // Engine phase: grab the keyboard so Esc cancels the engine.
+            self.overlay
+                .send(OverlayMessage::Busy {
+                    label: label.into(),
+                    grab_keyboard: true,
+                })
+                .await;
+            let rendered = match input {
+                Some(text) => prompt.render(text),
+                None => prompt.template.clone(),
+            };
+            let raw = llm::run_engine(&config.engine, &rendered, cancel).await?;
+            prompt.clean_output(&raw)
+        } else {
+            input.context("no text to send")?.to_string()
+        };
+
+        // Release the grab: a paste needs focus back in the target window, and a
+        // slow output command must not hold the keyboard.
+        self.overlay
+            .send(OverlayMessage::Busy {
+                label: label.into(),
+                grab_keyboard: false,
+            })
+            .await;
+        if prompt.output.is_empty() {
+            sleep(Duration::from_millis(FOCUS_RETURN_SETTLE_MS)).await;
+            clipboard::paste_text(&config.tools, &text, cancel).await?;
+        } else if let Err(error) = clipboard::run_command(&prompt.output, Some(&text), cancel).await
+        {
+            log!(config, "[output] {error:#}");
+            clipboard::copy_text(&config.tools, &text, cancel).await?;
+            bail!("{} failed; the text is on the clipboard", prompt.name);
+        }
+        Ok(text)
     }
 
     async fn dictate_start(self: &Arc<Self>) -> Result<ClientResponse> {
@@ -321,7 +349,11 @@ impl App {
         Ok(ClientResponse::ok("dictation started"))
     }
 
-    async fn dictate_stop(&self) -> Result<ClientResponse> {
+    async fn dictate_stop(&self, prompt: Option<String>) -> Result<ClientResponse> {
+        let config = self.config();
+        let prompt = prompt
+            .map(|name| config.prompt(&name).cloned())
+            .transpose()?;
         let cancel = CancelToken::new();
         let (recorder, overlay_epoch) = {
             let mut state = self.state.lock().await;
@@ -355,8 +387,6 @@ impl App {
             })
             .await;
 
-        let config = self.config();
-        let overlay = self.overlay.clone();
         let whisper_server = self.whisper_server.clone();
         let outcome = async {
             // recorder.finish() joins the capture thread and writes the WAV —
@@ -381,19 +411,20 @@ impl App {
             let cleaned = cleanup::clean(&config.dictation.cleanup, &transcript);
             log!(config, "[dictate] cleaned: {cleaned}");
 
-            // Type phase: release the grab so focus returns to the target
-            // window before wtype types the transcript into it.
-            overlay
-                .send(OverlayMessage::Busy {
-                    label: "Typing".into(),
-                    grab_keyboard: false,
-                })
-                .await;
-            sleep(Duration::from_millis(FOCUS_RETURN_SETTLE_MS)).await;
-
-            clipboard::paste_text(&config.tools, &cleaned, &cancel).await?;
+            let label = match &prompt {
+                Some(prompt) => format!("Running {}", prompt.name),
+                None => "Typing".into(),
+            };
+            let text = self
+                .apply_prompt(
+                    prompt.as_ref().unwrap_or(&PromptConfig::default()),
+                    Some(&cleaned),
+                    &label,
+                    &cancel,
+                )
+                .await?;
             dictation::retire_recording(&config, audio_path, &transcript);
-            Ok::<String, anyhow::Error>(cleaned)
+            Ok::<String, anyhow::Error>(text)
         }
         .await;
 
@@ -402,8 +433,11 @@ impl App {
         match outcome {
             Ok(text) => {
                 log!(config, "[dictate] inserted: {text}");
-                self.flash_result(overlay_epoch, true, "Dictation inserted")
-                    .await;
+                let msg = prompt
+                    .as_ref()
+                    .and_then(sent_message)
+                    .unwrap_or_else(|| "Dictation inserted".into());
+                self.flash_result(overlay_epoch, true, msg).await;
                 Ok(ClientResponse::with_text("dictation complete", text))
             }
             Err(error) => {
@@ -494,7 +528,7 @@ impl App {
         };
 
         if is_recording {
-            self.dictate_stop().await
+            self.dictate_stop(None).await
         } else {
             self.dictate_start().await
         }
@@ -587,6 +621,10 @@ impl App {
     }
 }
 
+fn sent_message(prompt: &PromptConfig) -> Option<String> {
+    (!prompt.output.is_empty()).then(|| format!("Sent to {}", prompt.name))
+}
+
 fn request_label(request: &ClientRequest) -> &'static str {
     match request {
         ClientRequest::Status => "status",
@@ -594,7 +632,7 @@ fn request_label(request: &ClientRequest) -> &'static str {
         ClientRequest::TransformRaw { .. } => "transform-raw",
         ClientRequest::Pick => "pick",
         ClientRequest::DictateStart => "dictate-start",
-        ClientRequest::DictateStop => "dictate-stop",
+        ClientRequest::DictateStop { .. } => "dictate-stop",
         ClientRequest::DictateToggle => "dictate-toggle",
         ClientRequest::Cancel => "cancel",
     }
@@ -635,18 +673,17 @@ async fn run_picker(entries_json: &str) -> Result<Option<PickerResult>> {
 }
 
 /// Capture the current selection for a transform. The daemon always grabs it
-/// itself (copy probe via the clipboard). If the template has no `{{text}}`
-/// placeholder the selection is optional — a failed grab just yields `None` and
-/// the template runs as-is; if it *does* need text, a failed grab is an error.
+/// itself (copy probe via the clipboard). Unless the prompt `required` it — a
+/// `{{text}}` placeholder, or no template to run on its own — a failed grab just
+/// yields `None` and the template runs as-is.
 async fn resolve_selected_text(
     tools: &papagaia_core::ToolConfig,
-    template: &str,
+    required: bool,
     cancel: &CancelToken,
 ) -> Result<Option<String>> {
-    let needs_selection = template_needs_selection(template);
     match clipboard::capture_selection(tools, cancel).await {
         Ok(text) => Ok(Some(text)),
-        Err(_) if !needs_selection => Ok(None),
+        Err(_) if !required => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -670,7 +707,7 @@ mod tests {
                 paste_command: vec!["false".into()],
                 clipboard_settle_ms: 0,
             },
-            "say hello",
+            false,
             &CancelToken::new(),
         )
         .await

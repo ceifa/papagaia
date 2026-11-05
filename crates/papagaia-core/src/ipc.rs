@@ -15,7 +15,12 @@ pub enum ClientRequest {
     /// itself and then sent a separate Transform back.
     Pick,
     DictateStart,
-    DictateStop,
+    /// `prompt` sends the transcript through that saved prompt instead of
+    /// typing it.
+    DictateStop {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+    },
     DictateToggle,
     Cancel,
 }

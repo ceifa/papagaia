@@ -98,13 +98,10 @@ impl Config {
             &mut self.whisper.argv,
             &mut self.whisper.server_argv,
         ];
-        for argv in argv_fields {
+        let engines = self.engine.iter_mut().map(|engine| &mut engine.argv);
+        let outputs = self.prompts.iter_mut().map(|prompt| &mut prompt.output);
+        for argv in argv_fields.into_iter().chain(engines).chain(outputs) {
             for arg in argv.iter_mut() {
-                *arg = expand_home(arg);
-            }
-        }
-        for engine in &mut self.engine {
-            for arg in engine.argv.iter_mut() {
                 *arg = expand_home(arg);
             }
         }
@@ -347,13 +344,40 @@ where
     })
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct PromptConfig {
     pub name: String,
+    /// Empty skips the engine: the text goes to the output as-is.
+    #[serde(default)]
     pub template: String,
+    /// Command that receives the result on stdin instead of having it pasted.
+    #[serde(default)]
+    pub output: Vec<String>,
+    /// Pressed while push-to-talk is held, sends that dictation through this
+    /// prompt instead of typing it.
+    #[serde(default)]
+    pub dictate_key: String,
 }
 
 impl PromptConfig {
+    pub fn uses_engine(&self) -> bool {
+        !self.template.trim().is_empty()
+    }
+
+    /// One-line description for the picker and `prompt list`.
+    pub fn summary(&self) -> String {
+        if self.uses_engine() || self.output.is_empty() {
+            prompt_summary(&self.template)
+        } else {
+            let command: Vec<_> = self
+                .output
+                .iter()
+                .map(|arg| arg.rsplit_once('/').map_or(arg.as_str(), |(_, name)| name))
+                .collect();
+            prompt_summary(&format!("→ {}", command.join(" ")))
+        }
+    }
+
     pub fn render(&self, selected_text: &str) -> String {
         render_prompt_template(&self.template, selected_text)
     }
@@ -703,9 +727,40 @@ mod tests {
         let prompt = PromptConfig {
             name: "test".into(),
             template: "hello {{text}}".into(),
+            ..PromptConfig::default()
         };
 
         assert_eq!(prompt.render("world"), "hello world");
+    }
+
+    #[test]
+    fn a_prompt_without_template_skips_the_engine_and_pipes_to_its_output() {
+        let config: super::Config = toml::from_str(
+            r#"
+[engine]
+argv = ["codex", "{{prompt}}"]
+
+[[prompts]]
+name = "Agent"
+dictate_key = "F13"
+output = ["~/bin/inbox", "--new"]
+
+[[prompts]]
+name = "Fix"
+template = "Fix grammar: {{text}}"
+"#,
+        )
+        .expect("prompts should parse");
+
+        let agent = &config.prompts[0];
+        assert!(!agent.uses_engine());
+        assert_eq!(agent.dictate_key, "F13");
+        assert_eq!(agent.summary(), "→ inbox --new");
+
+        let fix = &config.prompts[1];
+        assert!(fix.uses_engine());
+        assert!(fix.output.is_empty() && fix.dictate_key.is_empty());
+        assert_eq!(fix.summary(), "Fix grammar: {{text}}");
     }
 
     #[test]

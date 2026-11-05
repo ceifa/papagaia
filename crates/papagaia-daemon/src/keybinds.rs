@@ -8,8 +8,10 @@
 //! focused app — pick keys whose passthrough is harmless (F13, RightCtrl). evdev
 //! reads block, so each device gets its own thread; key edges reach the runtime
 //! through an `UnboundedSender` (the same entry point CLI requests use).
-//! Push-to-talk edges go through one gesture thread first, which tells a hold
-//! from a double-tap lock.
+//! Push-to-talk, pick and dictate-key edges go through one chord thread first,
+//! which tells a hold from a double-tap lock and decides what a combination
+//! means: a dictate key overlapping a dictation routes it to that key's prompt,
+//! and the pick key only opens the picker when no dictation overlapped it.
 
 use std::{
     collections::HashSet,
@@ -34,19 +36,21 @@ const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// dictation on.
 const TAP: Duration = Duration::from_millis(300);
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum Action {
     PushToTalk,
     Toggle,
     Pick,
+    /// Held during a dictation: send it through the named prompt.
+    Dictate(String),
 }
 
 struct Binding {
     code: u16,
     action: Action,
-    /// Held-state for a tap key, shared across a keyboard's multiple event nodes so
-    /// duplicate edges collapse into single transitions. Push-to-talk keeps its
-    /// own in `Gesture`.
+    /// Held-state for the toggle key, shared across a keyboard's multiple event
+    /// nodes so duplicate edges collapse into single transitions. The other keys
+    /// keep theirs in `Chords`.
     pressed: AtomicBool,
 }
 
@@ -74,13 +78,20 @@ pub fn spawn(
     {
         let requests = requests.clone();
         let busy = busy.clone();
-        thread::spawn(move || gesture_loop(edge_rx, requests, busy));
+        thread::spawn(move || chord_loop(edge_rx, requests, busy));
     }
     thread::spawn(move || watch_loop(bindings, requests, edges, busy));
 }
 
-/// A push-to-talk key edge: pressed or released, and when it was read.
-type Edge = (bool, Instant);
+/// A key edge for the chord thread (`true` = pressed), and when it was read.
+#[derive(Debug, Clone, PartialEq)]
+enum Key {
+    Talk(bool),
+    Pick(bool),
+    Dictate(String, bool),
+}
+
+type Edge = (Key, Instant);
 
 fn watch_loop(
     bindings: Arc<Vec<Binding>>,
@@ -173,25 +184,30 @@ fn dispatch(
     busy: &AtomicBool,
 ) -> bool {
     // value: 1 = down, 0 = up, 2 = auto-repeat (ignored).
-    match binding.action {
-        Action::PushToTalk => match value {
-            0 | 1 => edges.send((value == 1, Instant::now())).is_ok(),
-            _ => true,
-        },
-        Action::Toggle => fire_on_tap(binding, value, requests, busy, ClientRequest::DictateToggle),
-        Action::Pick => fire_on_tap(binding, value, requests, busy, ClientRequest::Pick),
+    if value != 0 && value != 1 {
+        return true;
     }
+    let down = value == 1;
+    let key = match &binding.action {
+        Action::Toggle => {
+            return fire_on_tap(binding, value, requests, busy, ClientRequest::DictateToggle);
+        }
+        Action::PushToTalk => Key::Talk(down),
+        Action::Pick => Key::Pick(down),
+        Action::Dictate(prompt) => Key::Dictate(prompt.clone(), down),
+    };
+    edges.send((key, Instant::now())).is_ok()
 }
 
-/// Feed push-to-talk edges through `Gesture`, waking up for its tap deadline.
-fn gesture_loop(
+/// Feed key edges through `Chords`, waking up for its tap deadline.
+fn chord_loop(
     edges: std_mpsc::Receiver<Edge>,
     requests: UnboundedSender<ClientRequest>,
     busy: Arc<AtomicBool>,
 ) {
-    let mut gesture = Gesture::default();
+    let mut chords = Chords::default();
     loop {
-        let edge = match gesture.deadline() {
+        let edge = match chords.gesture.deadline() {
             Some(deadline) => {
                 match edges.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(edge) => Some(edge),
@@ -204,15 +220,101 @@ fn gesture_loop(
                 Err(_) => return,
             },
         };
+        let busy = busy.load(Ordering::SeqCst);
         let request = match edge {
-            Some((true, at)) => gesture.press(at, busy.load(Ordering::SeqCst)),
-            Some((false, at)) => gesture.release(at),
-            None => gesture.expire(),
+            Some((key, at)) => chords.key(key, at, busy),
+            None => chords.expire(),
         };
         if let Some(request) = request
             && requests.send(request).is_err()
         {
             return;
+        }
+    }
+}
+
+/// Everything the chord thread tracks across keys.
+#[derive(Debug, Default)]
+struct Chords {
+    gesture: Gesture,
+    /// The prompt of the dictate key held right now.
+    held: Option<String>,
+    /// The prompt the dictation in progress goes to.
+    route: Option<String>,
+    pick: PickKey,
+}
+
+/// The pick key fires on release, and only for a press no dictation overlapped,
+/// so it can share a key with a dictate key.
+#[derive(Debug, Default, PartialEq)]
+enum PickKey {
+    #[default]
+    Up,
+    Armed,
+    Spent,
+}
+
+impl Chords {
+    fn key(&mut self, key: Key, now: Instant, busy: bool) -> Option<ClientRequest> {
+        match key {
+            Key::Talk(true) => {
+                if self.pick != PickKey::Up {
+                    self.pick = PickKey::Spent;
+                }
+                let request = self.gesture.press(now, busy);
+                self.routed(request)
+            }
+            Key::Talk(false) => {
+                let request = self.gesture.release(now);
+                self.routed(request)
+            }
+            Key::Dictate(prompt, true) => {
+                if self.gesture.recording() {
+                    self.route = Some(prompt.clone());
+                }
+                self.held = Some(prompt);
+                None
+            }
+            Key::Dictate(prompt, false) => {
+                if self.held.as_ref() == Some(&prompt) {
+                    self.held = None;
+                }
+                None
+            }
+            Key::Pick(true) => {
+                if self.pick == PickKey::Up {
+                    self.pick = if busy || self.gesture.recording() {
+                        PickKey::Spent
+                    } else {
+                        PickKey::Armed
+                    };
+                }
+                None
+            }
+            Key::Pick(false) => {
+                let armed = std::mem::take(&mut self.pick) == PickKey::Armed;
+                (armed && !busy).then_some(ClientRequest::Pick)
+            }
+        }
+    }
+
+    fn expire(&mut self) -> Option<ClientRequest> {
+        let request = self.gesture.expire();
+        self.routed(request)
+    }
+
+    /// A dictation takes the dictate key held when it starts, and ends with the
+    /// last one pressed during it.
+    fn routed(&mut self, request: Option<ClientRequest>) -> Option<ClientRequest> {
+        match request {
+            Some(ClientRequest::DictateStart) => {
+                self.route = self.held.clone();
+                request
+            }
+            Some(ClientRequest::DictateStop { .. }) => Some(ClientRequest::DictateStop {
+                prompt: self.route.take(),
+            }),
+            other => other,
         }
     }
 }
@@ -262,7 +364,7 @@ impl Gesture {
             }
             Gesture::Locked => {
                 *self = Gesture::Spent;
-                Some(ClientRequest::DictateStop)
+                Some(ClientRequest::DictateStop { prompt: None })
             }
             Gesture::Held { .. } | Gesture::SecondPress { .. } | Gesture::Spent => None,
         }
@@ -280,7 +382,7 @@ impl Gesture {
             }
             Gesture::Held { .. } | Gesture::SecondPress { .. } => {
                 *self = Gesture::Idle;
-                Some(ClientRequest::DictateStop)
+                Some(ClientRequest::DictateStop { prompt: None })
             }
             Gesture::Spent => {
                 *self = Gesture::Idle;
@@ -288,6 +390,10 @@ impl Gesture {
             }
             Gesture::Idle | Gesture::Tapped { .. } | Gesture::Locked => None,
         }
+    }
+
+    fn recording(&self) -> bool {
+        !matches!(self, Gesture::Idle | Gesture::Spent)
     }
 
     fn deadline(&self) -> Option<Instant> {
@@ -302,7 +408,7 @@ impl Gesture {
         match *self {
             Gesture::Tapped { .. } => {
                 *self = Gesture::Idle;
-                Some(ClientRequest::DictateStop)
+                Some(ClientRequest::DictateStop { prompt: None })
             }
             _ => None,
         }
@@ -332,7 +438,29 @@ fn fire_on_tap(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ClientRequest::{DictateStart, DictateStop};
+    use ClientRequest::{DictateStart, Pick};
+
+    const STOP: ClientRequest = ClientRequest::DictateStop { prompt: None };
+
+    fn stop_to(prompt: &str) -> Option<ClientRequest> {
+        Some(ClientRequest::DictateStop {
+            prompt: Some(prompt.into()),
+        })
+    }
+
+    /// Feed `keys` half a second apart (no taps) to fresh `Chords`, returning what each one sent.
+    fn play(keys: &[Key]) -> Vec<Option<ClientRequest>> {
+        let t = Instant::now();
+        let mut chords = Chords::default();
+        keys.iter()
+            .enumerate()
+            .map(|(i, key)| chords.key(key.clone(), ms(t, 500 * i as u64), false))
+            .collect()
+    }
+
+    fn agent(down: bool) -> Key {
+        Key::Dictate("Agent".into(), down)
+    }
 
     fn ms(start: Instant, ms: u64) -> Instant {
         start + Duration::from_millis(ms)
@@ -343,7 +471,7 @@ mod tests {
         let t = Instant::now();
         let mut gesture = Gesture::default();
         assert_eq!(gesture.press(t, false), Some(DictateStart));
-        assert_eq!(gesture.release(ms(t, 1200)), Some(DictateStop));
+        assert_eq!(gesture.release(ms(t, 1200)), Some(STOP));
         assert_eq!(gesture, Gesture::Idle);
     }
 
@@ -358,7 +486,7 @@ mod tests {
         assert_eq!(gesture, Gesture::Locked);
         assert_eq!(gesture.deadline(), None);
 
-        assert_eq!(gesture.press(ms(t, 9000), false), Some(DictateStop));
+        assert_eq!(gesture.press(ms(t, 9000), false), Some(STOP));
         assert_eq!(gesture.release(ms(t, 9100)), None);
         assert_eq!(gesture, Gesture::Idle);
     }
@@ -370,7 +498,7 @@ mod tests {
         gesture.press(t, false);
         assert_eq!(gesture.release(ms(t, 150)), None);
         assert_eq!(gesture.deadline(), Some(ms(t, 450)));
-        assert_eq!(gesture.expire(), Some(DictateStop));
+        assert_eq!(gesture.expire(), Some(STOP));
         assert_eq!(gesture, Gesture::Idle);
     }
 
@@ -381,7 +509,7 @@ mod tests {
         gesture.press(t, false);
         gesture.release(ms(t, 100));
         assert_eq!(gesture.press(ms(t, 200), false), None);
-        assert_eq!(gesture.release(ms(t, 2000)), Some(DictateStop));
+        assert_eq!(gesture.release(ms(t, 2000)), Some(STOP));
         assert_eq!(gesture, Gesture::Idle);
     }
 
@@ -391,7 +519,7 @@ mod tests {
         let mut gesture = Gesture::default();
         assert_eq!(gesture.press(t, false), Some(DictateStart));
         assert_eq!(gesture.press(t, false), None);
-        assert_eq!(gesture.release(ms(t, 1000)), Some(DictateStop));
+        assert_eq!(gesture.release(ms(t, 1000)), Some(STOP));
         assert_eq!(gesture.release(ms(t, 1000)), None);
     }
 
@@ -402,5 +530,79 @@ mod tests {
         assert_eq!(gesture.press(t, true), None);
         assert_eq!(gesture.release(ms(t, 100)), None);
         assert_eq!(gesture, Gesture::Idle);
+    }
+
+    #[test]
+    fn a_dictate_key_pressed_during_a_hold_routes_the_dictation_to_its_prompt() {
+        use Key::Talk;
+        let sent = play(&[
+            Talk(true),
+            Key::Pick(true),
+            agent(true),
+            Key::Pick(false),
+            agent(false),
+            Talk(false),
+        ]);
+        assert_eq!(
+            sent,
+            [Some(DictateStart), None, None, None, None, stop_to("Agent")]
+        );
+    }
+
+    #[test]
+    fn a_dictate_key_held_before_push_to_talk_also_routes() {
+        use Key::Talk;
+        let sent = play(&[
+            Key::Pick(true),
+            agent(true),
+            Talk(true),
+            Talk(false),
+            Key::Pick(false),
+            agent(false),
+        ]);
+        assert_eq!(
+            sent,
+            [None, None, Some(DictateStart), stop_to("Agent"), None, None]
+        );
+    }
+
+    #[test]
+    fn the_route_lasts_one_dictation() {
+        use Key::Talk;
+        let t = Instant::now();
+        let mut chords = Chords::default();
+        chords.key(Talk(true), t, false);
+        chords.key(agent(true), ms(t, 10), false);
+        chords.key(agent(false), ms(t, 20), false);
+        assert_eq!(
+            chords.key(Talk(false), ms(t, 1000), false),
+            stop_to("Agent")
+        );
+        chords.key(Talk(true), ms(t, 5000), false);
+        assert_eq!(chords.key(Talk(false), ms(t, 6000), false), Some(STOP));
+    }
+
+    #[test]
+    fn a_dictate_key_alone_does_nothing_and_the_pick_key_alone_opens_the_picker_on_release() {
+        assert_eq!(play(&[agent(true), agent(false)]), [None, None]);
+        assert_eq!(
+            play(&[
+                Key::Pick(true),
+                Key::Pick(true),
+                Key::Pick(false),
+                Key::Pick(false)
+            ]),
+            [None, None, Some(Pick), None]
+        );
+    }
+
+    #[test]
+    fn the_pick_key_does_nothing_while_busy() {
+        let t = Instant::now();
+        let mut chords = Chords::default();
+        assert_eq!(chords.key(Key::Pick(true), t, true), None);
+        assert_eq!(chords.key(Key::Pick(false), ms(t, 50), false), None);
+        chords.key(Key::Pick(true), ms(t, 100), false);
+        assert_eq!(chords.key(Key::Pick(false), ms(t, 150), true), None);
     }
 }

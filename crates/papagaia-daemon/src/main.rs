@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
         );
     }
     // Resolve the keybinds before `config` is moved into the App.
-    let bindings = build_keybinds(&config.keybinds);
+    let bindings = build_keybinds(&config);
 
     let app = Arc::new(App::new(config).await?);
 
@@ -93,15 +93,25 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Resolve the `[keybinds]` config into `(keycode, action)` pairs, skipping empty
-/// entries and warning on unrecognized key names.
-fn build_keybinds(config: &papagaia_core::KeybindsConfig) -> Vec<(u16, keybinds::Action)> {
+/// Resolve `[keybinds]` and the prompts' `dictate_key`s into `(keycode, action)`
+/// pairs, skipping empty entries and warning on unrecognized key names.
+fn build_keybinds(config: &Config) -> Vec<(u16, keybinds::Action)> {
+    let keys = &config.keybinds;
     let mut bindings = Vec::new();
+    let prompt_keys = config.prompts.iter().map(|prompt| {
+        (
+            &prompt.dictate_key,
+            keybinds::Action::Dictate(prompt.name.clone()),
+        )
+    });
     for (key, action) in [
-        (&config.push_to_talk, keybinds::Action::PushToTalk),
-        (&config.toggle, keybinds::Action::Toggle),
-        (&config.pick, keybinds::Action::Pick),
-    ] {
+        (&keys.push_to_talk, keybinds::Action::PushToTalk),
+        (&keys.toggle, keybinds::Action::Toggle),
+        (&keys.pick, keybinds::Action::Pick),
+    ]
+    .into_iter()
+    .chain(prompt_keys)
+    {
         if key.trim().is_empty() {
             continue;
         }
