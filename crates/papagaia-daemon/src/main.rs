@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
     // Global hotkeys: a background evdev watcher (see `keybinds`) feeds key edges
     // into the very same request handler the socket clients use, so there is a
     // single state machine and one set of races to reason about.
-    if !bindings.is_empty() {
+    {
         let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel::<ClientRequest>();
         let app_for_requests = app.clone();
         tokio::spawn(async move {
@@ -121,10 +121,8 @@ fn build_keybinds(config: &Config) -> Vec<(u16, keybinds::Action)> {
         }
     }
     // Esc cancels from here rather than from the overlay, which would have to
-    // take keyboard focus from the app being dictated into to see it.
-    if !bindings.is_empty() {
-        bindings.push((evdev::KeyCode::KEY_ESC.code(), keybinds::Action::Cancel));
-    }
+    // take keyboard focus from the app being typed into to see it.
+    bindings.push((evdev::KeyCode::KEY_ESC.code(), keybinds::Action::Cancel));
     bindings
 }
 
@@ -196,32 +194,21 @@ async fn handle_connection(app: Arc<App>, stream: UnixStream) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn bindings_for(keybinds: &str) -> Vec<(u16, keybinds::Action)> {
-        let path = std::env::temp_dir().join(format!(
-            "papagaia-keybinds-{}-{}.toml",
-            std::process::id(),
-            keybinds.len()
-        ));
+    #[test]
+    fn esc_cancels_even_without_hotkeys() {
+        let path =
+            std::env::temp_dir().join(format!("papagaia-keybinds-{}.toml", std::process::id()));
         fs::write(
             &path,
-            format!("[engine]\nargv = [\"cat\"]\n\n[keybinds]\n{keybinds}\n"),
+            "[engine]\nargv = [\"cat\"]\n\n[keybinds]\npush_to_talk = \"\"\n",
         )
         .unwrap();
         let config = Config::load_from_path(&path).unwrap();
         let _ = fs::remove_file(&path);
-        build_keybinds(&config)
-    }
 
-    #[test]
-    fn esc_cancels_whenever_a_hotkey_is_bound() {
-        let bindings = bindings_for("push_to_talk = \"RightCtrl\"");
-        assert!(bindings.iter().any(|(code, action)| {
-            *code == evdev::KeyCode::KEY_ESC.code() && *action == keybinds::Action::Cancel
-        }));
-    }
-
-    #[test]
-    fn esc_is_not_watched_without_hotkeys() {
-        assert!(bindings_for("push_to_talk = \"\"").is_empty());
+        let bindings = build_keybinds(&config);
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].0, evdev::KeyCode::KEY_ESC.code());
+        assert!(bindings[0].1 == keybinds::Action::Cancel);
     }
 }

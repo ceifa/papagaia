@@ -1,8 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     f64::consts::{FRAC_PI_2, PI},
-    io::{self, BufRead, BufReader, Read, Write},
-    os::unix::net::UnixStream,
+    io::{self, BufRead, Read},
     rc::Rc,
     thread,
 };
@@ -13,7 +12,7 @@ use glib::{self, ControlFlow};
 use gtk::prelude::*;
 use gtk4 as gtk;
 use gtk4_layer_shell::{self as layer_shell, LayerShell};
-use papagaia_core::{ClientRequest, OverlayMessage, PickerEntry, PickerResult};
+use papagaia_core::{OverlayMessage, PickerEntry, PickerResult};
 
 /// Number of bars in the waveform and the drawing-area dimensions of the pill's
 /// voice meter. Kept compact so the pill stays small, like Wispr Flow.
@@ -349,24 +348,12 @@ fn build_ui(app: &gtk::Application) {
 
     window.init_layer_shell();
     window.set_layer(layer_shell::Layer::Overlay);
+    // The app being dictated into keeps focus; the daemon watches Esc itself.
     window.set_keyboard_mode(layer_shell::KeyboardMode::None);
     // Bottom-center, like Wispr Flow. Anchoring only to the bottom edge (no
     // left/right) lets layer-shell center the pill horizontally.
     window.set_anchor(layer_shell::Edge::Bottom, true);
     window.set_margin(layer_shell::Edge::Bottom, 48);
-
-    let key_ctrl = gtk::EventControllerKey::new();
-    key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
-    key_ctrl.connect_key_pressed(move |_, key, _, _| {
-        if key == gtk::gdk::Key::Escape {
-            thread::spawn(|| {
-                send_cancel();
-            });
-            return glib::Propagation::Stop;
-        }
-        glib::Propagation::Proceed
-    });
-    window.add_controller(key_ctrl);
 
     let card = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -611,25 +598,14 @@ fn apply_message(state: &Rc<UiState>, message: OverlayMessage) {
         OverlayMessage::Hidden => {
             begin_hide(state);
         }
-        OverlayMessage::Busy {
-            label,
-            grab_keyboard,
-        } => {
+        OverlayMessage::Busy { label } => {
             set_state_class(state, "state-busy");
             state.glyph.set_visible(false);
             state.wave.kind.set(WaveKind::Processing);
             state.wave.area.set_visible(true);
             state.message.set_visible(true);
             state.message.set_label(&label);
-            // An exclusive grab is how Esc-to-cancel works on layer-shell; the
-            // daemon only asks for it when no other window needs focus.
-            let mode = if grab_keyboard {
-                layer_shell::KeyboardMode::Exclusive
-            } else {
-                layer_shell::KeyboardMode::None
-            };
-            state.window.set_keyboard_mode(mode);
-            request_show(state, grab_keyboard);
+            request_show(state);
         }
         OverlayMessage::Recording { level, target } => {
             set_state_class(state, "state-recording");
@@ -643,12 +619,8 @@ fn apply_message(state: &Rc<UiState>, message: OverlayMessage) {
             if let Some(target) = target {
                 state.message.set_label(&target);
             }
-            // The dictation target keeps focus; the daemon watches Esc itself.
-            state
-                .window
-                .set_keyboard_mode(layer_shell::KeyboardMode::None);
             set_wave_level(&state.wave, level);
-            request_show(state, false);
+            request_show(state);
         }
         OverlayMessage::Result { ok, message } => {
             set_state_class(state, if ok { "state-success" } else { "state-error" });
@@ -657,10 +629,7 @@ fn apply_message(state: &Rc<UiState>, message: OverlayMessage) {
             state.wave.area.set_visible(false);
             state.message.set_visible(true);
             state.message.set_label(&message);
-            state
-                .window
-                .set_keyboard_mode(layer_shell::KeyboardMode::None);
-            request_show(state, false);
+            request_show(state);
         }
         OverlayMessage::Notice { message } => {
             set_state_class(state, "state-notice");
@@ -669,10 +638,7 @@ fn apply_message(state: &Rc<UiState>, message: OverlayMessage) {
             state.wave.area.set_visible(false);
             state.message.set_visible(true);
             state.message.set_label(&message);
-            state
-                .window
-                .set_keyboard_mode(layer_shell::KeyboardMode::None);
-            request_show(state, false);
+            request_show(state);
         }
     }
 }
@@ -725,9 +691,9 @@ fn step_wave(wave: &Wave) {
     wave.area.queue_draw();
 }
 
-/// Marks the overlay to fade in (or stay visible) and presents/shows the
-/// window. A fresh fade-in only starts on the hidden→visible transition.
-fn request_show(state: &UiState, present: bool) {
+/// Marks the overlay to fade in (or stay visible) and shows the window. A fresh
+/// fade-in only starts on the hidden→visible transition.
+fn request_show(state: &UiState) {
     if !state.shown.get() {
         state.opacity.set(0.0);
         state.card.set_opacity(0.0);
@@ -735,19 +701,12 @@ fn request_show(state: &UiState, present: bool) {
     }
     state.pending_hide.set(false);
     state.target_opacity.set(1.0);
-    if present {
-        state.window.present();
-    } else {
-        state.window.show();
-    }
+    state.window.show();
 }
 
 /// Begins a fade-out. The window is unmapped for real by `step_opacity` once
 /// the card reaches full transparency.
 fn begin_hide(state: &UiState) {
-    state
-        .window
-        .set_keyboard_mode(layer_shell::KeyboardMode::None);
     if !state.shown.get() {
         finish_hide(state);
         return;
@@ -782,26 +741,6 @@ fn step_opacity(state: &UiState) {
     if state.pending_hide.get() && next <= 0.001 {
         finish_hide(state);
     }
-}
-
-fn send_cancel() {
-    let socket = match papagaia_core::socket_path() {
-        Ok(path) => path,
-        Err(_) => return,
-    };
-    let mut stream = match UnixStream::connect(&socket) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let request = match serde_json::to_string(&ClientRequest::Cancel) {
-        Ok(json) => format!("{json}\n"),
-        Err(_) => return,
-    };
-    let _ = stream.write_all(request.as_bytes());
-    let _ = stream.flush();
-    // Read response to avoid broken pipe on daemon side
-    let mut response = String::new();
-    let _ = BufReader::new(stream).read_line(&mut response);
 }
 
 // ---------------------------------------------------------------------------
