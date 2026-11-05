@@ -5,8 +5,8 @@ use std::sync::{
 
 use anyhow::{Context, Result, bail};
 use papagaia_core::{
-    ClientRequest, ClientResponse, Config, OverlayMessage, PickerEntry, PickerResult, PromptConfig,
-    overlay_program, prompt_summary, template_needs_selection,
+    ClientRequest, ClientResponse, Config, DictationTarget, OverlayMessage, PickerEntry,
+    PickerResult, PromptConfig, overlay_program, template_needs_selection,
 };
 use tokio::{
     sync::{Mutex, mpsc},
@@ -89,6 +89,8 @@ struct RecordingSession {
     /// Stops a runaway recording after `MAX_RECORDING_SECS`. Aborted on a normal
     /// stop so no hour-long timer stays parked.
     auto_stop: JoinHandle<()>,
+    /// Shared with `level_forwarder`, which shows it on the HUD.
+    target: Arc<std::sync::Mutex<Option<DictationTarget>>>,
 }
 
 struct BusySession {
@@ -137,7 +139,8 @@ impl App {
             ClientRequest::Transform { prompt } => self.transform(&prompt).await,
             ClientRequest::TransformRaw { template } => self.transform_raw(&template).await,
             ClientRequest::Pick => self.pick().await,
-            ClientRequest::DictateStart => self.dictate_start().await,
+            ClientRequest::DictateStart { to } => self.dictate_start(to).await,
+            ClientRequest::DictateTo { to } => self.dictate_to(to).await,
             ClientRequest::DictateStop => self.dictate_stop().await,
             ClientRequest::DictateToggle => self.dictate_toggle().await,
             ClientRequest::Cancel => self.cancel().await,
@@ -150,11 +153,8 @@ impl App {
     }
 
     async fn transform_raw(&self, template: &str) -> Result<ClientResponse> {
-        let prompt = PromptConfig {
-            name: "ad-hoc".into(),
-            template: template.into(),
-        };
-        self.run_transform(prompt, "engine output").await
+        self.run_transform(ad_hoc(template.into()), "engine output")
+            .await
     }
 
     /// Show the prompt picker and run whatever the user chooses. The daemon owns
@@ -171,18 +171,7 @@ impl App {
     }
 
     async fn pick_inner(&self) -> Result<ClientResponse> {
-        let config = self.config();
-        let entries: Vec<PickerEntry> = config
-            .prompts
-            .iter()
-            .map(|prompt| PickerEntry {
-                name: prompt.name.clone(),
-                summary: prompt_summary(&prompt.template),
-            })
-            .collect();
-        let entries_json = serde_json::to_string(&entries)?;
-
-        let Some(choice) = run_picker(&entries_json).await? else {
+        let Some(prompt) = self.choose_prompt().await? else {
             return Ok(ClientResponse::ok("picker cancelled"));
         };
 
@@ -190,15 +179,37 @@ impl App {
         // transform grabs the selection / pastes into it.
         sleep(Duration::from_millis(FOCUS_RETURN_SETTLE_MS)).await;
 
-        match choice {
-            PickerResult::Template { name } => self.transform(&name).await,
-            PickerResult::Raw { template } => self.transform_raw(&template).await,
-        }
+        let label = if prompt.name == AD_HOC {
+            "engine output".to_string()
+        } else {
+            prompt.name.clone()
+        };
+        self.run_transform(prompt, &label).await
     }
 
-    /// Run one prompt through the engine and insert the result. Owns the whole
-    /// pipeline: busy state, selection capture, engine, paste, and overlay
-    /// feedback — one linear flow, like `dictate_stop`.
+    /// Show the picker: a saved prompt, an ad-hoc one typed into it, or `None`
+    /// when dismissed.
+    async fn choose_prompt(&self) -> Result<Option<PromptConfig>> {
+        let config = self.config();
+        let entries: Vec<PickerEntry> = config
+            .prompts
+            .iter()
+            .map(|prompt| PickerEntry {
+                name: prompt.name.clone(),
+                summary: prompt.summary(),
+            })
+            .collect();
+        let prompt = match run_picker(&serde_json::to_string(&entries)?).await? {
+            None => None,
+            Some(PickerResult::Template { name }) => Some(config.prompt(&name)?.clone()),
+            Some(PickerResult::Raw { template }) => Some(ad_hoc(template)),
+        };
+        Ok(prompt)
+    }
+
+    /// Run one prompt on the selection. Owns the whole pipeline: busy state,
+    /// selection capture, `apply_prompt`, and overlay feedback — one linear flow,
+    /// like `dictate_stop`.
     async fn run_transform(
         &self,
         prompt: PromptConfig,
@@ -221,35 +232,13 @@ impl App {
                     grab_keyboard: false,
                 })
                 .await;
-            let selected = resolve_selected_text(&config.tools, &prompt.template, &cancel).await?;
-
-            // Engine phase: grab the keyboard so Esc cancels the engine.
-            overlay
-                .send(OverlayMessage::Busy {
-                    label: label.clone(),
-                    grab_keyboard: true,
-                })
-                .await;
-
-            let rendered = match &selected {
-                Some(text) => prompt.render(text),
-                None => prompt.template.clone(),
-            };
+            let required = !prompt.uses_engine() || template_needs_selection(&prompt.template);
+            let selected = resolve_selected_text(&config.tools, required, &cancel).await?;
             log!(config, "[transform] selected={}", selected.is_some());
 
-            let raw = llm::run_engine(&config.engine, &rendered, &cancel).await?;
-            let output = prompt.clean_output(&raw);
-
-            // Paste phase: release the grab so focus returns before wtype pastes.
-            overlay
-                .send(OverlayMessage::Busy {
-                    label,
-                    grab_keyboard: false,
-                })
-                .await;
-            sleep(Duration::from_millis(FOCUS_RETURN_SETTLE_MS)).await;
-            clipboard::paste_text(&config.tools, &output, &cancel).await?;
-
+            let output = self
+                .apply_prompt(&prompt, selected.as_deref(), &label, &cancel)
+                .await?;
             log!(config, "[transform] final output: {output}");
             Ok((output, selected.is_some()))
         }
@@ -259,7 +248,9 @@ impl App {
 
         match outcome {
             Ok((text, had_selection)) => {
-                let msg = if had_selection {
+                let msg = if let Some(sent) = sent_message(&prompt) {
+                    sent
+                } else if had_selection {
                     format!("Replaced selection with {success_label}")
                 } else {
                     format!("Pasted {success_label}")
@@ -277,7 +268,57 @@ impl App {
         }
     }
 
-    async fn dictate_start(self: &Arc<Self>) -> Result<ClientResponse> {
+    /// `input` is the selection or a transcript.
+    async fn apply_prompt(
+        &self,
+        prompt: &PromptConfig,
+        input: Option<&str>,
+        label: &str,
+        cancel: &CancelToken,
+    ) -> Result<String> {
+        let config = self.config();
+        let text = if prompt.uses_engine() {
+            // Engine phase: grab the keyboard so Esc cancels the engine.
+            self.overlay
+                .send(OverlayMessage::Busy {
+                    label: label.into(),
+                    grab_keyboard: true,
+                })
+                .await;
+            let rendered = match input {
+                Some(text) => prompt.render(text),
+                None => prompt.template.clone(),
+            };
+            let raw = llm::run_engine(&config.engine, &rendered, cancel).await?;
+            prompt.clean_output(&raw)
+        } else {
+            input.context("no text to send")?.to_string()
+        };
+
+        // Release the grab: a paste needs focus back in the target window, and a
+        // slow output command must not hold the keyboard.
+        self.overlay
+            .send(OverlayMessage::Busy {
+                label: label.into(),
+                grab_keyboard: false,
+            })
+            .await;
+        if prompt.output.is_empty() {
+            sleep(Duration::from_millis(FOCUS_RETURN_SETTLE_MS)).await;
+            clipboard::paste_text(&config.tools, &text, cancel).await?;
+        } else if let Err(error) = clipboard::run_command(&prompt.output, Some(&text), cancel).await
+        {
+            log!(config, "[output] {error:#}");
+            clipboard::copy_text(&config.tools, &text, cancel).await?;
+            bail!("{} failed; the text is on the clipboard", prompt.name);
+        }
+        Ok(text)
+    }
+
+    async fn dictate_start(
+        self: &Arc<Self>,
+        to: Option<DictationTarget>,
+    ) -> Result<ClientResponse> {
         let overlay_epoch;
         {
             let mut state = self.state.lock().await;
@@ -291,9 +332,14 @@ impl App {
             let (level_tx, mut level_rx) = mpsc::unbounded_channel();
             let recorder = Recorder::start(level_tx)?;
             let overlay = self.overlay.clone();
+            let target = Arc::new(std::sync::Mutex::new(to.clone()));
+            let shown_target = target.clone();
             let level_forwarder = tokio::spawn(async move {
                 while let Some(level) = level_rx.recv().await {
-                    overlay.send(OverlayMessage::Recording { level }).await;
+                    let target = target_label(shown_target.lock().unwrap().as_ref());
+                    overlay
+                        .send(OverlayMessage::Recording { level, target })
+                        .await;
                 }
             });
 
@@ -310,20 +356,34 @@ impl App {
                 overlay_epoch,
                 level_forwarder,
                 auto_stop,
+                target,
             });
         }
 
         // Show the recording HUD right away so feedback is instant.
         self.overlay
-            .send(OverlayMessage::Recording { level: 0.0 })
+            .send(OverlayMessage::Recording {
+                level: 0.0,
+                target: target_label(to.as_ref()),
+            })
             .await;
 
         Ok(ClientResponse::ok("dictation started"))
     }
 
+    async fn dictate_to(&self, to: DictationTarget) -> Result<ClientResponse> {
+        let state = self.state.lock().await;
+        let State::Recording(session) = &*state else {
+            bail!("papagaia is not recording");
+        };
+        *session.target.lock().unwrap() = Some(to);
+        Ok(ClientResponse::ok("dictation redirected"))
+    }
+
     async fn dictate_stop(&self) -> Result<ClientResponse> {
+        let config = self.config();
         let cancel = CancelToken::new();
-        let (recorder, overlay_epoch) = {
+        let (recorder, overlay_epoch, to) = {
             let mut state = self.state.lock().await;
             if !matches!(*state, State::Recording(_)) {
                 bail!("papagaia is not recording");
@@ -343,7 +403,8 @@ impl App {
                 overlay_epoch,
             };
             self.busy.store(true, Ordering::SeqCst);
-            (session.recorder, overlay_epoch)
+            let to = session.target.lock().unwrap().take();
+            (session.recorder, overlay_epoch, to)
         };
 
         // Transcribe phase: whisper reads the WAV file, no foreign focus needed,
@@ -355,8 +416,6 @@ impl App {
             })
             .await;
 
-        let config = self.config();
-        let overlay = self.overlay.clone();
         let whisper_server = self.whisper_server.clone();
         let outcome = async {
             // recorder.finish() joins the capture thread and writes the WAV —
@@ -381,29 +440,40 @@ impl App {
             let cleaned = cleanup::clean(&config.dictation.cleanup, &transcript);
             log!(config, "[dictate] cleaned: {cleaned}");
 
-            // Type phase: release the grab so focus returns to the target
-            // window before wtype types the transcript into it.
-            overlay
-                .send(OverlayMessage::Busy {
-                    label: "Typing".into(),
-                    grab_keyboard: false,
-                })
-                .await;
-            sleep(Duration::from_millis(FOCUS_RETURN_SETTLE_MS)).await;
-
-            clipboard::paste_text(&config.tools, &cleaned, &cancel).await?;
             dictation::retire_recording(&config, audio_path, &transcript);
-            Ok::<String, anyhow::Error>(cleaned)
+
+            let (prompt, label) = match to {
+                None => (PromptConfig::default(), "Typing".to_string()),
+                Some(DictationTarget::Prompt { name }) => {
+                    let prompt = config.prompt(&name)?.clone();
+                    let label = format!("Running {name}");
+                    (prompt, label)
+                }
+                Some(DictationTarget::Picker) => {
+                    // The picker needs the keyboard the HUD is grabbing.
+                    self.overlay.send(OverlayMessage::Hidden).await;
+                    let Some(prompt) = self.choose_prompt().await? else {
+                        clipboard::copy_text(&config.tools, &cleaned, &cancel).await?;
+                        return Err(SoftOutcome("Dictation copied to the clipboard".into()).into());
+                    };
+                    let label = format!("Running {}", prompt.name);
+                    (prompt, label)
+                }
+            };
+            let text = self
+                .apply_prompt(&prompt, Some(&cleaned), &label, &cancel)
+                .await?;
+            Ok::<_, anyhow::Error>((text, prompt))
         }
         .await;
 
         self.leave_busy(overlay_epoch).await;
 
         match outcome {
-            Ok(text) => {
+            Ok((text, prompt)) => {
                 log!(config, "[dictate] inserted: {text}");
-                self.flash_result(overlay_epoch, true, "Dictation inserted")
-                    .await;
+                let msg = sent_message(&prompt).unwrap_or_else(|| "Dictation inserted".into());
+                self.flash_result(overlay_epoch, true, msg).await;
                 Ok(ClientResponse::with_text("dictation complete", text))
             }
             Err(error) => {
@@ -496,7 +566,7 @@ impl App {
         if is_recording {
             self.dictate_stop().await
         } else {
-            self.dictate_start().await
+            self.dictate_start(None).await
         }
     }
 
@@ -587,13 +657,32 @@ impl App {
     }
 }
 
+fn target_label(target: Option<&DictationTarget>) -> Option<String> {
+    target.map(|target| format!("→ {}", target.label()))
+}
+
+const AD_HOC: &str = "ad-hoc";
+
+fn ad_hoc(template: String) -> PromptConfig {
+    PromptConfig {
+        name: AD_HOC.into(),
+        template,
+        ..PromptConfig::default()
+    }
+}
+
+fn sent_message(prompt: &PromptConfig) -> Option<String> {
+    (!prompt.output.is_empty()).then(|| format!("Sent to {}", prompt.name))
+}
+
 fn request_label(request: &ClientRequest) -> &'static str {
     match request {
         ClientRequest::Status => "status",
         ClientRequest::Transform { .. } => "transform",
         ClientRequest::TransformRaw { .. } => "transform-raw",
         ClientRequest::Pick => "pick",
-        ClientRequest::DictateStart => "dictate-start",
+        ClientRequest::DictateStart { .. } => "dictate-start",
+        ClientRequest::DictateTo { .. } => "dictate-to",
         ClientRequest::DictateStop => "dictate-stop",
         ClientRequest::DictateToggle => "dictate-toggle",
         ClientRequest::Cancel => "cancel",
@@ -635,18 +724,17 @@ async fn run_picker(entries_json: &str) -> Result<Option<PickerResult>> {
 }
 
 /// Capture the current selection for a transform. The daemon always grabs it
-/// itself (copy probe via the clipboard). If the template has no `{{text}}`
-/// placeholder the selection is optional — a failed grab just yields `None` and
-/// the template runs as-is; if it *does* need text, a failed grab is an error.
+/// itself (copy probe via the clipboard). Unless the prompt `required` it — a
+/// `{{text}}` placeholder, or no template to run on its own — a failed grab just
+/// yields `None` and the template runs as-is.
 async fn resolve_selected_text(
     tools: &papagaia_core::ToolConfig,
-    template: &str,
+    required: bool,
     cancel: &CancelToken,
 ) -> Result<Option<String>> {
-    let needs_selection = template_needs_selection(template);
     match clipboard::capture_selection(tools, cancel).await {
         Ok(text) => Ok(Some(text)),
-        Err(_) if !needs_selection => Ok(None),
+        Err(_) if !required => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -670,7 +758,7 @@ mod tests {
                 paste_command: vec!["false".into()],
                 clipboard_settle_ms: 0,
             },
-            "say hello",
+            false,
             &CancelToken::new(),
         )
         .await

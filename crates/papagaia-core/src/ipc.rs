@@ -14,10 +14,36 @@ pub enum ClientRequest {
     /// chosen prompt. Replaces the old CLI-driven picker that spawned the overlay
     /// itself and then sent a separate Transform back.
     Pick,
-    DictateStart,
+    /// `to` sends the transcript somewhere other than the focused app.
+    DictateStart {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<DictationTarget>,
+    },
+    /// Redirect the dictation in progress.
+    DictateTo {
+        to: DictationTarget,
+    },
     DictateStop,
     DictateToggle,
     Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum DictationTarget {
+    /// A saved prompt, by name.
+    Prompt { name: String },
+    /// Whatever the user picks in the prompt picker.
+    Picker,
+}
+
+impl DictationTarget {
+    pub fn label(&self) -> &str {
+        match self {
+            DictationTarget::Prompt { name } => name,
+            DictationTarget::Picker => "Picker",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +95,9 @@ pub enum OverlayMessage {
     },
     Recording {
         level: f32,
+        /// Where the transcript goes, when not to the focused app.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
     },
     Result {
         ok: bool,

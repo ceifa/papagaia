@@ -152,7 +152,7 @@ fn print_prompt_templates() -> Result<()> {
     println!("Saved prompts ({}):", config.prompts.len());
     println!();
     for prompt in &config.prompts {
-        let summary = papagaia_core::prompt_summary(&prompt.template);
+        let summary = prompt.summary();
         println!("  {:<width$}  {}", prompt.name, summary, width = name_width);
     }
     println!();
