@@ -631,14 +631,18 @@ fn apply_message(state: &Rc<UiState>, message: OverlayMessage) {
             state.window.set_keyboard_mode(mode);
             request_show(state, grab_keyboard);
         }
-        OverlayMessage::Recording { level } => {
+        OverlayMessage::Recording { level, target } => {
             set_state_class(state, "state-recording");
             state.glyph.set_visible(true);
             state.glyph.set_label("●");
             state.wave.kind.set(WaveKind::Listening);
             state.wave.area.set_visible(true);
-            // Listening shows only the waveform (Wispr-style).
-            state.message.set_visible(false);
+            // Listening shows only the waveform (Wispr-style), plus where the
+            // transcript goes when that isn't the focused app.
+            state.message.set_visible(target.is_some());
+            if let Some(target) = target {
+                state.message.set_label(&target);
+            }
             // The user is speaking, not typing, so the exclusive grab (for Esc) is safe.
             state
                 .window

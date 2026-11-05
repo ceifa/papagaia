@@ -89,6 +89,8 @@ struct RecordingSession {
     /// Stops a runaway recording after `MAX_RECORDING_SECS`. Aborted on a normal
     /// stop so no hour-long timer stays parked.
     auto_stop: JoinHandle<()>,
+    /// Shared with `level_forwarder`, which shows it on the HUD.
+    target: Arc<std::sync::Mutex<Option<DictationTarget>>>,
 }
 
 struct BusySession {
@@ -137,8 +139,9 @@ impl App {
             ClientRequest::Transform { prompt } => self.transform(&prompt).await,
             ClientRequest::TransformRaw { template } => self.transform_raw(&template).await,
             ClientRequest::Pick => self.pick().await,
-            ClientRequest::DictateStart => self.dictate_start().await,
-            ClientRequest::DictateStop { to } => self.dictate_stop(to).await,
+            ClientRequest::DictateStart { to } => self.dictate_start(to).await,
+            ClientRequest::DictateTo { to } => self.dictate_to(to).await,
+            ClientRequest::DictateStop => self.dictate_stop().await,
             ClientRequest::DictateToggle => self.dictate_toggle().await,
             ClientRequest::Cancel => self.cancel().await,
         }
@@ -312,7 +315,10 @@ impl App {
         Ok(text)
     }
 
-    async fn dictate_start(self: &Arc<Self>) -> Result<ClientResponse> {
+    async fn dictate_start(
+        self: &Arc<Self>,
+        to: Option<DictationTarget>,
+    ) -> Result<ClientResponse> {
         let overlay_epoch;
         {
             let mut state = self.state.lock().await;
@@ -326,9 +332,14 @@ impl App {
             let (level_tx, mut level_rx) = mpsc::unbounded_channel();
             let recorder = Recorder::start(level_tx)?;
             let overlay = self.overlay.clone();
+            let target = Arc::new(std::sync::Mutex::new(to.clone()));
+            let shown_target = target.clone();
             let level_forwarder = tokio::spawn(async move {
                 while let Some(level) = level_rx.recv().await {
-                    overlay.send(OverlayMessage::Recording { level }).await;
+                    let target = target_label(shown_target.lock().unwrap().as_ref());
+                    overlay
+                        .send(OverlayMessage::Recording { level, target })
+                        .await;
                 }
             });
 
@@ -345,21 +356,34 @@ impl App {
                 overlay_epoch,
                 level_forwarder,
                 auto_stop,
+                target,
             });
         }
 
         // Show the recording HUD right away so feedback is instant.
         self.overlay
-            .send(OverlayMessage::Recording { level: 0.0 })
+            .send(OverlayMessage::Recording {
+                level: 0.0,
+                target: target_label(to.as_ref()),
+            })
             .await;
 
         Ok(ClientResponse::ok("dictation started"))
     }
 
-    async fn dictate_stop(&self, to: Option<DictationTarget>) -> Result<ClientResponse> {
+    async fn dictate_to(&self, to: DictationTarget) -> Result<ClientResponse> {
+        let state = self.state.lock().await;
+        let State::Recording(session) = &*state else {
+            bail!("papagaia is not recording");
+        };
+        *session.target.lock().unwrap() = Some(to);
+        Ok(ClientResponse::ok("dictation redirected"))
+    }
+
+    async fn dictate_stop(&self) -> Result<ClientResponse> {
         let config = self.config();
         let cancel = CancelToken::new();
-        let (recorder, overlay_epoch) = {
+        let (recorder, overlay_epoch, to) = {
             let mut state = self.state.lock().await;
             if !matches!(*state, State::Recording(_)) {
                 bail!("papagaia is not recording");
@@ -379,7 +403,8 @@ impl App {
                 overlay_epoch,
             };
             self.busy.store(true, Ordering::SeqCst);
-            (session.recorder, overlay_epoch)
+            let to = session.target.lock().unwrap().take();
+            (session.recorder, overlay_epoch, to)
         };
 
         // Transcribe phase: whisper reads the WAV file, no foreign focus needed,
@@ -539,9 +564,9 @@ impl App {
         };
 
         if is_recording {
-            self.dictate_stop(None).await
+            self.dictate_stop().await
         } else {
-            self.dictate_start().await
+            self.dictate_start(None).await
         }
     }
 
@@ -632,6 +657,10 @@ impl App {
     }
 }
 
+fn target_label(target: Option<&DictationTarget>) -> Option<String> {
+    target.map(|target| format!("→ {}", target.label()))
+}
+
 const AD_HOC: &str = "ad-hoc";
 
 fn ad_hoc(template: String) -> PromptConfig {
@@ -652,8 +681,9 @@ fn request_label(request: &ClientRequest) -> &'static str {
         ClientRequest::Transform { .. } => "transform",
         ClientRequest::TransformRaw { .. } => "transform-raw",
         ClientRequest::Pick => "pick",
-        ClientRequest::DictateStart => "dictate-start",
-        ClientRequest::DictateStop { .. } => "dictate-stop",
+        ClientRequest::DictateStart { .. } => "dictate-start",
+        ClientRequest::DictateTo { .. } => "dictate-to",
+        ClientRequest::DictateStop => "dictate-stop",
         ClientRequest::DictateToggle => "dictate-toggle",
         ClientRequest::Cancel => "cancel",
     }
