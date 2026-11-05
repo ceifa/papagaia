@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use alsa::{
@@ -18,7 +19,26 @@ use tokio::sync::mpsc;
 
 const WHISPER_SAMPLE_RATE: u32 = 16000;
 pub const MAX_RECORDING_SECS: u64 = 3600; // 1 hour
-const FRAMES_PER_READ: usize = 1024;
+/// 20 ms: the release tail is counted from the audio read so far, so a read
+/// still in flight at the release would shorten it by up to its own length.
+const FRAMES_PER_READ: usize = 320;
+
+/// Audio kept past the key release: people let go while still finishing the last
+/// word, and cutting it mid-syllable makes whisper guess another one.
+const RELEASE_TAIL_MS: usize = 200;
+/// While speech runs into the tail it grows, up to this much past the release.
+const MAX_RELEASE_TAIL_MS: usize = 600;
+const FRAME_MS: usize = 20;
+/// Speech must fill this much of the audio right before the tail's end to grow it,
+/// so a key click never does.
+const SPEECH_RUN_MS: usize = 100;
+/// A grown tail ends after this much quiet.
+const QUIET_END_MS: usize = 160;
+/// Only this much audio before the release estimates the noise floor.
+const NOISE_FLOOR_WINDOW_MS: usize = 10_000;
+/// Speech is 12 dB (4x amplitude) over the noise floor, and never quieter than this.
+const SPEECH_OVER_FLOOR: f32 = 4.0;
+const MIN_SPEECH_RMS: f32 = 300.0;
 
 pub struct Recorder {
     stop: Arc<AtomicBool>,
@@ -79,17 +99,21 @@ impl Recorder {
         })
     }
 
-    /// Stops recording and writes a WAV file. Returns the path and duration in seconds.
+    /// Captures the release tail, stops recording and writes a WAV file. Returns the
+    /// path and duration in seconds.
     pub fn finish(mut self) -> Result<(PathBuf, f64)> {
+        let samples_arc = self.samples.take().expect("samples taken twice");
+        let end = self.wait_for_tail(&samples_arc);
+
         self.stop.store(true, Ordering::Release);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
 
-        let samples_arc = self.samples.take().expect("samples taken twice");
-        let samples = Arc::try_unwrap(samples_arc)
+        let mut samples = Arc::try_unwrap(samples_arc)
             .map(|mutex| mutex.into_inner().expect("recorder sample lock poisoned"))
             .unwrap_or_else(|arc| arc.lock().expect("recorder sample lock poisoned").clone());
+        samples.truncate(end);
 
         let audio_path = std::env::temp_dir().join(format!(
             "papagaia-{}.wav",
@@ -117,6 +141,84 @@ impl Recorder {
 
         Ok((audio_path, duration_secs))
     }
+
+    /// Keep capturing past the release until `release_tail_end` says the clip is
+    /// complete, and return where it ends. A stalled or dead capture can't hold the
+    /// dictation hostage: it finishes with whatever arrived.
+    fn wait_for_tail(&self, samples: &Mutex<Vec<i16>>) -> usize {
+        let release = samples.lock().expect("recorder sample lock poisoned").len();
+        let start = release.saturating_sub(ms_to_samples(NOISE_FLOOR_WINDOW_MS));
+        let deadline = Instant::now() + Duration::from_millis(MAX_RELEASE_TAIL_MS as u64 + 100);
+        loop {
+            let captured = samples.lock().expect("recorder sample lock poisoned");
+            if let Some(end) = release_tail_end(&captured[start..], release - start) {
+                return start + end;
+            }
+            let capturing = self.handle.as_ref().is_some_and(|h| !h.is_finished());
+            if !capturing || Instant::now() >= deadline {
+                return captured.len();
+            }
+            drop(captured);
+            thread::sleep(Duration::from_millis(FRAME_MS as u64));
+        }
+    }
+}
+
+fn ms_to_samples(ms: usize) -> usize {
+    ms * WHISPER_SAMPLE_RATE as usize / 1000
+}
+
+/// Where a clip released at sample `release` should end, or `None` while more
+/// audio is needed to decide. The tail is `RELEASE_TAIL_MS`, unless speech is
+/// still running at its end: then it lasts until `QUIET_END_MS` of quiet, capped
+/// at `MAX_RELEASE_TAIL_MS`.
+fn release_tail_end(samples: &[i16], release: usize) -> Option<usize> {
+    let frame = ms_to_samples(FRAME_MS);
+    let base = release + ms_to_samples(RELEASE_TAIL_MS);
+    let cap = release + ms_to_samples(MAX_RELEASE_TAIL_MS);
+    if samples.len() < base {
+        return None;
+    }
+
+    let threshold =
+        (noise_floor(&samples[..release], frame) * SPEECH_OVER_FLOOR).max(MIN_SPEECH_RMS);
+    let is_speech = |end: usize| frame_rms(&samples[end - frame..end]) > threshold;
+
+    let run_frames = SPEECH_RUN_MS / FRAME_MS;
+    let speech_in_run = (0..run_frames)
+        .filter(|k| is_speech(base - k * frame))
+        .count();
+    // One quiet frame is a gap between syllables, not the end of the word.
+    if speech_in_run + 1 < run_frames {
+        return Some(base);
+    }
+
+    let quiet_frames = QUIET_END_MS / FRAME_MS;
+    let mut quiet = 0;
+    let mut end = base + frame;
+    while end <= samples.len().min(cap) {
+        quiet = if is_speech(end) { 0 } else { quiet + 1 };
+        if quiet == quiet_frames {
+            return Some(end);
+        }
+        end += frame;
+    }
+    (samples.len() >= cap).then_some(cap)
+}
+
+/// The room's level: the quietest tenth of the frames before the release.
+fn noise_floor(samples: &[i16], frame: usize) -> f32 {
+    let mut levels: Vec<f32> = samples.chunks_exact(frame).map(frame_rms).collect();
+    if levels.is_empty() {
+        return 0.0;
+    }
+    levels.sort_by(f32::total_cmp);
+    levels[levels.len() / 10]
+}
+
+fn frame_rms(frame: &[i16]) -> f32 {
+    let sum_sq: f64 = frame.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
+    (sum_sq / frame.len() as f64).sqrt() as f32
 }
 
 /// Dispose of a finished recording: delete it, unless `dictation.recordings_dir`
@@ -280,4 +382,71 @@ fn compute_rms(data: &[i16]) -> Option<f32> {
         .sum();
     let rms = (sum_sq / data.len() as f32).sqrt();
     Some(rms.clamp(0.0, 1.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROOM: i16 = 40;
+    const VOICE: i16 = 4000;
+
+    /// A square wave at `amplitude`: steady RMS, enough for the energy classifier.
+    fn tone(ms: usize, amplitude: i16) -> Vec<i16> {
+        (0..ms_to_samples(ms))
+            .map(|i| if i % 32 < 16 { amplitude } else { -amplitude })
+            .collect()
+    }
+
+    fn clip(parts: &[(usize, i16)]) -> Vec<i16> {
+        parts.iter().flat_map(|&(ms, amp)| tone(ms, amp)).collect()
+    }
+
+    #[test]
+    fn waits_until_the_base_tail_has_arrived() {
+        let samples = clip(&[(1000, ROOM), (150, ROOM)]);
+        assert_eq!(release_tail_end(&samples, ms_to_samples(1000)), None);
+    }
+
+    #[test]
+    fn a_release_after_the_speech_keeps_just_the_base_tail() {
+        let samples = clip(&[(500, ROOM), (500, VOICE), (300, ROOM), (700, ROOM)]);
+        let release = ms_to_samples(1300);
+        assert_eq!(
+            release_tail_end(&samples, release),
+            Some(release + ms_to_samples(RELEASE_TAIL_MS))
+        );
+    }
+
+    #[test]
+    fn a_word_said_through_the_release_keeps_the_tail_open_until_it_ends() {
+        // Released at 1000 ms while the word runs on to 1360 ms.
+        let samples = clip(&[(500, ROOM), (860, VOICE), (700, ROOM)]);
+        let release = ms_to_samples(1000);
+        let end = ms_to_samples(1360 + QUIET_END_MS);
+        assert_eq!(release_tail_end(&samples, release), Some(end));
+        // Until that quiet has arrived, the clip isn't done.
+        assert_eq!(release_tail_end(&samples[..end - 1], release), None);
+    }
+
+    #[test]
+    fn speech_that_carries_on_stops_the_tail_at_its_cap() {
+        let samples = clip(&[(500, ROOM), (2000, VOICE)]);
+        let release = ms_to_samples(1000);
+        assert_eq!(
+            release_tail_end(&samples, release),
+            Some(release + ms_to_samples(MAX_RELEASE_TAIL_MS))
+        );
+    }
+
+    #[test]
+    fn a_key_click_never_grows_the_tail() {
+        // A 40 ms click right at the base tail's end.
+        let samples = clip(&[(1000, ROOM), (160, ROOM), (40, VOICE), (800, ROOM)]);
+        let release = ms_to_samples(1000);
+        assert_eq!(
+            release_tail_end(&samples, release),
+            Some(release + ms_to_samples(RELEASE_TAIL_MS))
+        );
+    }
 }

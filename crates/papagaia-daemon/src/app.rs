@@ -369,7 +369,9 @@ impl App {
                 stt::transcribe(&config.whisper, &whisper_server, &audio_path, &cancel).await?;
             let transcript = transcript.trim().to_string();
             log!(config, "[dictate] transcript: {transcript}");
-            if transcript.is_empty() {
+            if transcript.is_empty()
+                || stt::echoes_prompt(&transcript, &config.whisper.initial_prompt())
+            {
                 dictation::retire_recording(&config, audio_path, &transcript);
                 return Err(SoftOutcome("No speech detected".into()).into());
             }

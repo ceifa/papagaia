@@ -726,11 +726,13 @@ enabled = true
 # back to the cli path below when the server is unreachable.
 backend = "{whisper_backend}"
 model = "{whisper_model}"
-argv = ["whisper-cli", "-m", "{{{{model}}}}", "-f", "{{{{audio_path}}}}", "-np", "-nt", "-l", "{language}"{vad_args}, "--prompt", "Natural spoken dictation with correct punctuation, natural sentences, and no filler words."]
+# Names whisper should spell right; they ride along with the prompt as {{{{prompt}}}}.
+# vocabulary = ["Papagaia", "Wayland", "niri"]
+argv = ["whisper-cli", "-m", "{{{{model}}}}", "-f", "{{{{audio_path}}}}", "-np", "-nt", "-l", "{language}"{vad_args}, "--prompt", "{{{{prompt}}}}"]
 # Warm-server backend: the daemon launches and supervises whisper-server itself.
 server_url = "http://127.0.0.1:8080"
 manage_server = true
-server_argv = ["whisper-server", "-m", "{{{{model}}}}", "--host", "127.0.0.1", "--port", "8080", "-l", "{language}"{vad_args}]
+server_argv = ["whisper-server", "-m", "{{{{model}}}}", "--host", "127.0.0.1", "--port", "8080", "-l", "{language}"{vad_args}, "--prompt", "{{{{prompt}}}}"]
 
 [dictation.cleanup]
 # Fast, local, rule-based polish applied to every transcript (no LLM).

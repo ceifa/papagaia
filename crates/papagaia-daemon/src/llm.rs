@@ -75,7 +75,7 @@ pub async fn run_whisper(
         &[
             ("model", &whisper.model),
             ("audio_path", audio_path),
-            ("prompt", &whisper.prompt),
+            ("prompt", &whisper.initial_prompt()),
         ],
     );
     let output = run_command_allow_exit(&argv, cancel, &[WHISPER_EXIT_NO_SPEECH]).await?;
