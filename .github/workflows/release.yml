@@ -40,11 +40,12 @@ jobs:
           if ! git diff --cached --quiet; then
             git commit -m "Release v$VERSION"
           fi
-          if ! git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
-            git tag "v$VERSION"
-          fi
           git push origin HEAD:main
-          git push origin "v$VERSION"
+          # The checkout fetches no tags, so ask the remote whether this version was already tagged.
+          if ! git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+            git tag "v$VERSION"
+            git push origin "v$VERSION"
+          fi
           if ! gh release view "v$VERSION" >/dev/null 2>&1; then
             gh release create "v$VERSION" --generate-notes
           fi
@@ -82,9 +83,10 @@ jobs:
           sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
           sed -i "s|sha256sums=('[^']*'|sha256sums=('${SHA256}'|" PKGBUILD
 
-          # Generate .SRCINFO in Arch container (makepkg refuses to run as root)
+          # Generate .SRCINFO in Arch container (makepkg refuses to run as root).
+          # The builder shares the runner's uid so the checkout stays writable for the git steps below.
           docker run --rm -v "$(pwd):/pkg" archlinux:base-devel bash -c "
-            useradd -m builder && chown -R builder:builder /pkg &&
+            useradd -m -u $(id -u) builder &&
             su builder -c 'cd /pkg && makepkg --printsrcinfo > .SRCINFO'
           "
 
