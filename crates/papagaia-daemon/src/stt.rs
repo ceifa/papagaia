@@ -3,12 +3,11 @@
 //! much faster. Any non-cancellation server failure falls back to `cli`.
 //!
 //! The HTTP client is hand-rolled over `TcpStream` to avoid a `reqwest`/`hyper`
-//! dependency; the blocking I/O runs on `spawn_blocking` off the current-thread
-//! runtime.
+//! dependency. Audio is streamed from disk, and socket I/O is asynchronous so
+//! cancellation closes the connection without leaving a blocking request behind.
 
 use std::{
-    io::{Read, Write},
-    net::{SocketAddr, TcpStream, ToSocketAddrs},
+    net::{SocketAddr, ToSocketAddrs},
     path::Path,
     process::{Command, Stdio},
     sync::Arc,
@@ -17,6 +16,11 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use papagaia_core::{WhisperBackend, WhisperConfig};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    time::timeout,
+};
 
 use crate::{cancel::CancelToken, llm};
 
@@ -144,22 +148,14 @@ impl WhisperServer {
         if cancel.is_cancelled() {
             bail!("operation cancelled");
         }
-        let endpoint = self.endpoint.clone();
-        let audio_path = audio_path.to_path_buf();
-
-        // Run the synchronous POST (file read + socket I/O) on the blocking pool
-        // so the current-thread runtime stays responsive.
-        let join = tokio::task::spawn_blocking(move || {
-            let wav = std::fs::read(&audio_path)
-                .with_context(|| format!("failed to read {}", audio_path.display()))?;
-            post_inference(&endpoint, &wav)
-        });
-
-        // spawn_blocking can't be aborted mid-syscall; on cancel, stop waiting and
-        // let the detached task finish harmlessly (it's normally sub-second).
+        // Dropping the request closes the socket/file on cancellation. The
+        // deadline covers the entire upload + response, including slow peers.
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => bail!("operation cancelled"),
-            result = join => result.context("transcription task failed")?,
+            result = timeout(IO_TIMEOUT, post_inference(&self.endpoint, audio_path)) => {
+                result.context("whisper-server request timed out")?
+            }
         }
     }
 }
@@ -246,10 +242,18 @@ fn spawn_server_child(argv: &[String]) -> Option<std::process::Child> {
     }
 }
 
-/// Issue the multipart POST and return the transcript text.
-fn post_inference(endpoint: &Endpoint, wav: &[u8]) -> Result<String> {
+/// Issue the multipart POST without loading or copying the WAV into memory.
+async fn post_inference(endpoint: &Endpoint, audio_path: &Path) -> Result<String> {
+    let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(endpoint.addr))
+        .await
+        .context("connection to whisper-server timed out")?
+        .context("failed to connect to whisper-server")?;
+    let wav = tokio::fs::File::open(audio_path)
+        .await
+        .with_context(|| format!("failed to read {}", audio_path.display()))?;
+    let wav_len = wav.metadata().await?.len();
     let boundary = "----papagaiaFormBoundary";
-    let body = build_multipart_body(boundary, wav);
+    let (prefix, suffix) = multipart_parts(boundary);
     let head = format!(
         "POST {INFERENCE_PATH} HTTP/1.1\r\n\
          Host: {host}\r\n\
@@ -257,53 +261,46 @@ fn post_inference(endpoint: &Endpoint, wav: &[u8]) -> Result<String> {
          Content-Length: {len}\r\n\
          Connection: close\r\n\r\n",
         host = endpoint.host_header,
-        len = body.len(),
+        len = prefix.len() as u64 + wav_len + suffix.len() as u64,
     );
 
-    let mut stream = TcpStream::connect_timeout(&endpoint.addr, CONNECT_TIMEOUT)
-        .context("failed to connect to whisper-server")?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(&body)?;
-    stream.flush()?;
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(prefix.as_bytes()).await?;
+    // Larger disk reads amortize blocking-pool handoffs, while copy_buf writes
+    // directly from this fixed buffer instead of allocating a second WAV copy.
+    let mut wav = tokio::io::BufReader::with_capacity(64 * 1024, wav.take(wav_len));
+    let copied = tokio::io::copy_buf(&mut wav, &mut stream).await?;
+    if copied != wav_len {
+        bail!("recording changed during upload");
+    }
+    stream.write_all(suffix.as_bytes()).await?;
+    stream.flush().await?;
 
     // `Connection: close` → the server closes after the body, so read to EOF.
     let mut response = Vec::new();
     stream
         .read_to_end(&mut response)
+        .await
         .context("failed to read whisper-server response")?;
 
     parse_http_response(&response)
 }
 
-/// Build a `multipart/form-data` body: the WAV under field `file`, plus
-/// `response_format=json` so the reply is always `{"text": ...}`, a fixed
-/// temperature for deterministic output, and `split_on_word` so the server's
-/// 60-character segment wrapping (hardcoded whenever `max_len` is unset) lands
-/// between words instead of inside one.
-fn build_multipart_body(boundary: &str, wav: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(wav.len() + 512);
-    body.extend_from_slice(
-        format!(
-            "--{boundary}\r\n\
-             Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\
-             Content-Type: audio/wav\r\n\r\n"
-        )
-        .as_bytes(),
+/// Framing for the WAV plus response format and decoding options. Keeping the
+/// file separate bounds upload memory independently of recording duration.
+fn multipart_parts(boundary: &str) -> (String, String) {
+    let prefix = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\
+         Content-Type: audio/wav\r\n\r\n"
     );
-    body.extend_from_slice(wav);
-    body.extend_from_slice(b"\r\n");
-    body.extend_from_slice(
-        format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n\
-             --{boundary}\r\nContent-Disposition: form-data; name=\"temperature\"\r\n\r\n0.0\r\n\
-             --{boundary}\r\nContent-Disposition: form-data; name=\"split_on_word\"\r\n\r\ntrue\r\n\
-             --{boundary}--\r\n"
-        )
-        .as_bytes(),
+    let suffix = format!(
+        "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"temperature\"\r\n\r\n0.0\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"split_on_word\"\r\n\r\ntrue\r\n\
+         --{boundary}--\r\n"
     );
-    body
+    (prefix, suffix)
 }
 
 /// Split an HTTP/1.1 response, require a 2xx status, and extract `text` from the
@@ -343,6 +340,161 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AudioFixture(std::path::PathBuf);
+
+    impl AudioFixture {
+        fn new(len: u64) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "papagaia-upload-test-{}-{id}.wav",
+                std::process::id()
+            ));
+            std::fs::File::create(&path).unwrap().set_len(len).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for AudioFixture {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.0).unwrap();
+        }
+    }
+
+    async fn request_body(
+        socket: tokio::net::TcpStream,
+    ) -> (tokio::io::BufReader<tokio::net::TcpStream>, u64) {
+        use tokio::io::AsyncBufReadExt;
+        let mut reader = tokio::io::BufReader::new(socket);
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("Content-Length: ") {
+                length = Some(value.trim().parse().unwrap());
+            }
+        }
+        (reader, length.expect("request must include content length"))
+    }
+
+    async fn local_server() -> (WhisperServer, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        (
+            WhisperServer {
+                endpoint: Endpoint {
+                    addr,
+                    host_header: addr.to_string(),
+                },
+            },
+            listener,
+        )
+    }
+
+    #[tokio::test]
+    async fn upload_preserves_binary_audio_and_multipart_length() {
+        let audio = AudioFixture::new(0);
+        let bytes: Vec<u8> = (0..200_000).map(|i| (i % 256) as u8).collect();
+        std::fs::write(&audio.0, &bytes).unwrap();
+        let (server, listener) = local_server().await;
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (mut reader, length) = request_body(socket).await;
+            let mut body = Vec::new();
+            assert_eq!(
+                (&mut reader)
+                    .take(length)
+                    .read_to_end(&mut body)
+                    .await
+                    .unwrap() as u64,
+                length
+            );
+            let start = find_subsequence(&body, b"\r\n\r\n").unwrap() + 4;
+            assert_eq!(&body[start..start + bytes.len()], bytes);
+            assert!(body.ends_with(b"--papagaiaFormBoundary--\r\n"));
+            reader.get_mut().write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"text\":\" streamed transcript \"}").await.unwrap();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            server.transcribe(&audio.0, &CancelToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, "streamed transcript");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_closes_the_connection_while_waiting_for_response() {
+        let audio = AudioFixture::new(1024);
+        let (server, listener) = local_server().await;
+        let cancel = CancelToken::new();
+        let peer_cancel = cancel.clone();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (mut reader, length) = request_body(socket).await;
+            tokio::io::copy(&mut (&mut reader).take(length), &mut tokio::io::sink())
+                .await
+                .unwrap();
+            peer_cancel.cancel();
+            let mut byte = [0];
+            let read = tokio::time::timeout(Duration::from_secs(1), reader.read(&mut byte))
+                .await
+                .expect("cancelled request must close the socket")
+                .unwrap();
+            assert_eq!(read, 0);
+        });
+        let error = server.transcribe(&audio.0, &cancel).await.unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "manual upload memory/throughput benchmark; run alone in release mode"]
+    async fn benchmark_upload() {
+        // One hour of 16 kHz mono S16 PCM plus the WAV header. A sparse file
+        // avoids counting fixture construction against the client's peak RSS.
+        let audio = AudioFixture::new(16_000 * 2 * 3600 + 44);
+        let (server, listener) = local_server().await;
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (mut reader, length) = request_body(socket).await;
+            assert_eq!(
+                tokio::io::copy(&mut (&mut reader).take(length), &mut tokio::io::sink())
+                    .await
+                    .unwrap(),
+                length
+            );
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"text\":\"ok\"}")
+                .await
+                .unwrap();
+        });
+        let started = Instant::now();
+        assert_eq!(
+            server
+                .transcribe(&audio.0, &CancelToken::new())
+                .await
+                .unwrap(),
+            "ok"
+        );
+        peer.await.unwrap();
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        println!(
+            "upload: {:?}; {}",
+            started.elapsed(),
+            status
+                .lines()
+                .find(|line| line.starts_with("VmHWM:"))
+                .unwrap()
+        );
+    }
 
     #[test]
     fn a_recited_prompt_is_an_echo() {
@@ -388,8 +540,8 @@ mod tests {
 
     #[test]
     fn multipart_body_has_file_and_format_parts() {
-        let body = build_multipart_body("BOUND", b"RIFFdata");
-        let text = String::from_utf8_lossy(&body);
+        let (prefix, suffix) = multipart_parts("BOUND");
+        let text = format!("{prefix}RIFFdata{suffix}");
         assert!(text.contains("name=\"file\"; filename=\"audio.wav\""));
         assert!(text.contains("RIFFdata"));
         assert!(text.contains("name=\"response_format\""));

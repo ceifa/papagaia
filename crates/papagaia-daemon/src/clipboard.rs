@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use papagaia_core::ToolConfig;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
     time::{Duration, sleep},
 };
@@ -165,34 +165,11 @@ fn clipboard_probe_token() -> String {
     )
 }
 
-/// Block on `waitpid` for the given PID inside `spawn_blocking`, retrying on
-/// EINTR. Used to await child exit without holding `&mut Child` (so the caller
-/// can still call `start_kill`).
-async fn spawn_waitpid(pid: u32) -> std::io::Result<std::process::ExitStatus> {
-    tokio::task::spawn_blocking(move || {
-        use std::os::unix::process::ExitStatusExt;
-        let mut status: libc::c_int = 0;
-        loop {
-            let ret = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
-            if ret == -1 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(err);
-            }
-            return Ok(std::process::ExitStatus::from_raw(status));
-        }
-    })
-    .await
-    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
-}
-
 /// Spawn `argv`, optionally feed `stdin_text`, and collect stdout/stderr while
 /// waiting for exit.
 ///
-/// Reads the pipes concurrently with the exit wait (and writes stdin in its own
-/// task) so a child that fills a pipe buffer can't deadlock us — matters for long
+/// Reads the pipes and writes borrowed stdin concurrently with the exit wait,
+/// so a child that fills a pipe buffer cannot deadlock us — matters for long
 /// whisper/engine output. Avoids `wait_with_output()` because `wl-copy` forks a
 /// daemon that inherits our pipes and keeps them from reaching EOF; instead we
 /// stop at child exit and give the buffer a short bounded drain.
@@ -202,29 +179,21 @@ async fn run_child_collecting(
     cancel: &CancelToken,
     argv: &[String],
 ) -> Result<std::process::Output> {
-    if let Some(text) = stdin_text
-        && let Some(mut stdin) = child.stdin.take()
-    {
-        let text = text.to_string();
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
+    let child_stdin = child.stdin.take();
+    let write_stdin = async move {
+        if let (Some(text), Some(mut stdin)) = (stdin_text, child_stdin) {
             let _ = stdin.write_all(text.as_bytes()).await;
-            // Dropping `stdin` here closes the pipe so the child sees EOF.
-        });
-    }
+        }
+        // Close stdin at EOF, then disable this select branch. Keeping this
+        // future local also drops the pipe immediately on cancellation/error.
+        std::future::pending::<()>().await;
+    };
+    tokio::pin!(write_stdin);
 
     let mut child_stdout = child.stdout.take();
     let mut child_stderr = child.stderr.take();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-
-    let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
-    let wait_argv = argv.join(" ");
-    if let Some(pid) = child.id() {
-        tokio::spawn(async move {
-            let _ = exit_tx.send(spawn_waitpid(pid).await);
-        });
-    }
 
     let status = loop {
         tokio::select! {
@@ -232,17 +201,13 @@ async fn run_child_collecting(
             _ = cancel.cancelled() => {
                 let _ = child.start_kill();
                 // Still reap the child so it doesn't become a zombie.
-                let _ = exit_rx.await;
+                let _ = child.wait().await;
                 bail!("operation cancelled");
             }
-            result = &mut exit_rx => {
-                match result {
-                    Ok(Ok(status)) => break status,
-                    Ok(Err(error)) => return Err(error)
-                        .with_context(|| format!("failed to wait for {wait_argv}")),
-                    Err(_) => bail!("child wait task was dropped for {wait_argv}"),
-                }
+            result = child.wait() => {
+                break result.with_context(|| format!("failed to wait for {}", argv.join(" ")))?;
             }
+            _ = &mut write_stdin => unreachable!(),
             result = read_pipe_into(&mut child_stdout, &mut stdout) => result?,
             result = read_pipe_into(&mut child_stderr, &mut stderr) => result?,
         }
@@ -250,8 +215,16 @@ async fn run_child_collecting(
 
     // The child has exited; drain whatever is still buffered, bounded by a
     // short timeout (see the wl-copy note above).
-    append_drained(&mut child_stdout, &mut stdout).await;
-    append_drained(&mut child_stderr, &mut stderr).await;
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!("operation cancelled"),
+        _ = async {
+            tokio::join!(
+                append_drained(&mut child_stdout, &mut stdout),
+                append_drained(&mut child_stderr, &mut stderr),
+            );
+        } => {}
+    }
 
     Ok(std::process::Output {
         status,
@@ -332,6 +305,105 @@ mod tests {
     use crate::cancel::CancelToken;
 
     use super::{capture_selection, with_wl_copy_sensitive_flag};
+
+    #[tokio::test]
+    async fn collects_large_stdin_and_both_output_pipes_without_deadlock() {
+        let input = "long input\n".repeat(100_000);
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "cat; head -c 262144 /dev/zero >&2".into(),
+        ];
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::run_command(&argv, Some(&input), &CancelToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(output.stdout, input.as_bytes());
+        assert_eq!(output.stderr, vec![0; 262144]);
+    }
+
+    #[tokio::test]
+    async fn inherited_pipes_do_not_wait_for_a_background_descendant() {
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "sleep 2 & printf out; printf err >&2".into(),
+        ];
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::run_command(&argv, None, &CancelToken::new()),
+        )
+        .await
+        .expect("must not wait for the descendant's pipes")
+        .unwrap();
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+    }
+
+    #[tokio::test]
+    async fn cancellation_reaps_child_even_with_blocked_stdin() {
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let cancel = CancelToken::new();
+        let input = "x".repeat(1024 * 1024);
+        let argv = vec!["sleep".into(), "30".into()];
+        let (result, ()) = tokio::join!(
+            super::run_child_collecting(child, Some(&input), &cancel, &argv),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                cancel.cancel();
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[tokio::test]
+    async fn short_lived_commands_are_reaped_by_their_tokio_child() {
+        for _ in 0..64 {
+            let output = super::run_command(&["true".into()], None, &CancelToken::new())
+                .await
+                .unwrap();
+            assert!(output.status.success());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "manual subprocess latency benchmark"]
+    async fn benchmark_inherited_pipes() {
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            let argv = vec![
+                "sh".into(),
+                "-c".into(),
+                "sleep 1 & printf out; printf err >&2".into(),
+            ];
+            let output = super::run_command(&argv, None, &CancelToken::new())
+                .await
+                .unwrap();
+            assert_eq!(output.stdout, b"out");
+            assert_eq!(output.stderr, b"err");
+        }
+        println!("20 inherited-pipe commands: {:?}", started.elapsed());
+    }
 
     fn render_text_command(argv: &[String], text: &str) -> Vec<String> {
         let mut rendered = Vec::with_capacity(argv.len() + 1);

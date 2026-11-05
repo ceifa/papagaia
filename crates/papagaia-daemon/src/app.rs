@@ -9,7 +9,7 @@ use papagaia_core::{
     PickerResult, PromptConfig, overlay_program, template_needs_selection,
 };
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{Mutex, watch},
     task::JoinHandle,
     time::{Duration, sleep},
 };
@@ -315,17 +315,24 @@ impl App {
 
             // Start capturing audio immediately so the mic catches the user's
             // first words without waiting on anything else.
-            let (level_tx, mut level_rx) = mpsc::unbounded_channel();
+            let (level_tx, mut level_rx) = watch::channel(0.0);
             let recorder = Recorder::start(level_tx)?;
             let overlay = self.overlay.clone();
             let target = Arc::new(std::sync::Mutex::new(to.clone()));
             let shown_target = target.clone();
+            let show_levels = self.config.overlay.enabled;
             let level_forwarder = tokio::spawn(async move {
-                while let Some(level) = level_rx.recv().await {
+                if !show_levels {
+                    return; // Close the receiver so capture can skip RMS work.
+                }
+                while level_rx.changed().await.is_ok() {
+                    let level = *level_rx.borrow_and_update();
                     let target = target_label(shown_target.lock().unwrap().as_ref());
                     overlay
                         .send(OverlayMessage::Recording { level, target })
                         .await;
+                    // Match the HUD's frame rate and keep only the newest level.
+                    sleep(Duration::from_millis(33)).await;
                 }
             });
 
@@ -408,7 +415,15 @@ impl App {
             // No minimum-duration floor — whisper's VAD and the empty-transcript
             // guard below already drop accidental near-silent taps.
             let transcript =
-                stt::transcribe(&config.whisper, &whisper_server, &audio_path, &cancel).await?;
+                match stt::transcribe(&config.whisper, &whisper_server, &audio_path, &cancel).await
+                {
+                    Ok(transcript) => transcript,
+                    Err(error) => {
+                        // Failed/cancelled requests must not leave large WAVs in /tmp.
+                        dictation::retire_recording(&config, audio_path, "");
+                        return Err(error);
+                    }
+                };
             let transcript = transcript.trim().to_string();
             log!(config, "[dictate] transcript: {transcript}");
             if transcript.is_empty()
