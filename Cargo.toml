@@ -20,7 +20,7 @@ dirs = "6.0.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 libc = "0.2.186"
-tokio = { version = "1.52.3", features = ["macros", "rt", "net", "io-util", "process", "sync", "time", "signal"] }
+tokio = { version = "1.52.3", features = ["macros", "rt", "net", "io-util", "fs", "process", "sync", "time", "signal"] }
 toml = { version = "1.1.2", default-features = false, features = ["parse", "serde"] }
 
 [profile.release]

@@ -15,7 +15,7 @@ use alsa::{
 };
 use anyhow::{Context, Result};
 use papagaia_core::Config;
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 const WHISPER_SAMPLE_RATE: u32 = 16000;
 pub const MAX_RECORDING_SECS: u64 = 3600; // 1 hour
@@ -47,7 +47,7 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub fn start(level_tx: mpsc::UnboundedSender<f32>) -> Result<Self> {
+    pub fn start(level_tx: watch::Sender<f32>) -> Result<Self> {
         // The "default" ALSA device on a normal Linux desktop is the plug
         // device — it transparently performs sample-rate conversion, channel
         // downmix, and format conversion in libasound. We can therefore ask it
@@ -148,10 +148,15 @@ impl Recorder {
     fn wait_for_tail(&self, samples: &Mutex<Vec<i16>>) -> usize {
         let release = samples.lock().expect("recorder sample lock poisoned").len();
         let start = release.saturating_sub(ms_to_samples(NOISE_FLOOR_WINDOW_MS));
+        // The pre-release audio never changes. Classify its noise floor once,
+        // rather than rescanning and sorting it every 20 ms while waiting.
+        let threshold = speech_threshold(
+            &samples.lock().expect("recorder sample lock poisoned")[start..release],
+        );
         let deadline = Instant::now() + Duration::from_millis(MAX_RELEASE_TAIL_MS as u64 + 100);
         loop {
             let captured = samples.lock().expect("recorder sample lock poisoned");
-            if let Some(end) = release_tail_end(&captured[start..], release - start) {
+            if let Some(end) = release_tail_end(&captured[start..], release - start, threshold) {
                 return start + end;
             }
             let capturing = self.handle.as_ref().is_some_and(|h| !h.is_finished());
@@ -172,7 +177,7 @@ fn ms_to_samples(ms: usize) -> usize {
 /// audio is needed to decide. The tail is `RELEASE_TAIL_MS`, unless speech is
 /// still running at its end: then it lasts until `QUIET_END_MS` of quiet, capped
 /// at `MAX_RELEASE_TAIL_MS`.
-fn release_tail_end(samples: &[i16], release: usize) -> Option<usize> {
+fn release_tail_end(samples: &[i16], release: usize, threshold: f32) -> Option<usize> {
     let frame = ms_to_samples(FRAME_MS);
     let base = release + ms_to_samples(RELEASE_TAIL_MS);
     let cap = release + ms_to_samples(MAX_RELEASE_TAIL_MS);
@@ -180,8 +185,6 @@ fn release_tail_end(samples: &[i16], release: usize) -> Option<usize> {
         return None;
     }
 
-    let threshold =
-        (noise_floor(&samples[..release], frame) * SPEECH_OVER_FLOOR).max(MIN_SPEECH_RMS);
     let is_speech = |end: usize| frame_rms(&samples[end - frame..end]) > threshold;
 
     let run_frames = SPEECH_RUN_MS / FRAME_MS;
@@ -206,14 +209,18 @@ fn release_tail_end(samples: &[i16], release: usize) -> Option<usize> {
     (samples.len() >= cap).then_some(cap)
 }
 
+fn speech_threshold(samples: &[i16]) -> f32 {
+    (noise_floor(samples, ms_to_samples(FRAME_MS)) * SPEECH_OVER_FLOOR).max(MIN_SPEECH_RMS)
+}
+
 /// The room's level: the quietest tenth of the frames before the release.
 fn noise_floor(samples: &[i16], frame: usize) -> f32 {
     let mut levels: Vec<f32> = samples.chunks_exact(frame).map(frame_rms).collect();
     if levels.is_empty() {
         return 0.0;
     }
-    levels.sort_by(f32::total_cmp);
-    levels[levels.len() / 10]
+    let index = levels.len() / 10;
+    *levels.select_nth_unstable_by(index, f32::total_cmp).1
 }
 
 fn frame_rms(frame: &[i16]) -> f32 {
@@ -316,7 +323,7 @@ fn capture_loop(
     pcm: PCM,
     stop: Arc<AtomicBool>,
     samples: Arc<Mutex<Vec<i16>>>,
-    level_tx: mpsc::UnboundedSender<f32>,
+    level_tx: watch::Sender<f32>,
     max_samples: usize,
 ) {
     let io = match pcm.io_i16() {
@@ -348,7 +355,9 @@ fn capture_loop(
 
         let chunk = &buf[..frames];
         push_samples(chunk, &samples, max_samples);
-        if let Some(rms) = compute_rms(chunk) {
+        if !level_tx.is_closed()
+            && let Some(rms) = compute_rms(chunk)
+        {
             let _ = level_tx.send(rms);
         }
     }
@@ -387,6 +396,10 @@ fn compute_rms(data: &[i16]) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn release_tail_end(samples: &[i16], release: usize) -> Option<usize> {
+        super::release_tail_end(samples, release, speech_threshold(&samples[..release]))
+    }
 
     const ROOM: i16 = 40;
     const VOICE: i16 = 4000;

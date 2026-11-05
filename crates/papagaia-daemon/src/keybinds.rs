@@ -107,9 +107,23 @@ fn watch_loop(
 
     loop {
         let mut seen: HashSet<PathBuf> = HashSet::new();
-        for (path, device) in evdev::enumerate() {
+        // evdev::enumerate opens and probes every device before yielding it.
+        // Check paths first so idle rescans do not reopen active keyboards.
+        let paths = std::fs::read_dir("/dev/input")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_name().as_encoded_bytes().starts_with(b"event"))
+            .map(|entry| entry.path());
+        for path in paths {
             seen.insert(path.clone());
-            if watched.contains(&path) || !is_keyboard_like(&device, &codes) {
+            if watched.contains(&path) {
+                continue;
+            }
+            let Ok(device) = Device::open(&path) else {
+                continue;
+            };
+            if !is_keyboard_like(&device, &codes) {
                 continue;
             }
             watched.insert(path.clone());

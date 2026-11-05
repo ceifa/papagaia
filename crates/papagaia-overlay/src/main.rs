@@ -3,6 +3,7 @@ use std::{
     f64::consts::{FRAC_PI_2, PI},
     io::{self, BufRead, Read},
     rc::Rc,
+    sync::{Arc, Mutex},
     thread,
 };
 
@@ -404,7 +405,11 @@ fn build_ui(app: &gtk::Application) {
     // A blocking stdin reader forwards parsed messages over a channel; the local
     // future below wakes only on a message (no polling). Animation ticks are armed
     // only while there's something to animate (see `ensure_render_tick`).
-    let (tx, mut rx) = futures_channel::mpsc::unbounded::<OverlayMessage>();
+    // Keep a single latest state on both sides of the pipe. A stalled GTK
+    // loop must not accumulate old waveform levels or replay them after Busy.
+    let pending = Arc::new(Mutex::new(None));
+    let reader_pending = pending.clone();
+    let (mut tx, mut rx) = futures_channel::mpsc::channel::<()>(1);
     thread::spawn(move || {
         let stdin = io::stdin();
         let mut locked = stdin.lock();
@@ -414,10 +419,13 @@ fn build_ui(app: &gtk::Application) {
             match locked.read_line(&mut line) {
                 Ok(0) => break,
                 Ok(_) => {
-                    if let Ok(message) = serde_json::from_str::<OverlayMessage>(&line)
-                        && tx.unbounded_send(message).is_err()
-                    {
-                        break;
+                    if let Ok(message) = serde_json::from_str::<OverlayMessage>(&line) {
+                        *reader_pending.lock().unwrap() = Some(message);
+                        if let Err(error) = tx.try_send(())
+                            && error.is_disconnected()
+                        {
+                            break;
+                        }
                     }
                 }
                 Err(_) => break,
@@ -427,7 +435,9 @@ fn build_ui(app: &gtk::Application) {
 
     let apply_state = Rc::clone(&state);
     glib::spawn_future_local(async move {
-        while let Some(message) = rx.next().await {
+        while rx.next().await.is_some() {
+            let message = pending.lock().unwrap().take();
+            let Some(message) = message else { continue };
             apply_message(&apply_state, message);
             // Any message either starts a fade-in, a fade-out, or live bars, so
             // make sure the animation tick is running to carry it to rest.
@@ -585,6 +595,11 @@ fn rounded_bar(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, radius:
 }
 
 fn set_state_class(state: &UiState, name: &str) {
+    // Audio levels change ~30 times/s; changing CSS only on state transitions
+    // avoids invalidating style/layout on every waveform sample.
+    if state.card.has_css_class(name) {
+        return;
+    }
     for cls in STATE_CLASSES {
         state.card.remove_css_class(cls);
         state.window.remove_css_class(cls);
