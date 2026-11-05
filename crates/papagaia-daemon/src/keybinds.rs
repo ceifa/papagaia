@@ -44,6 +44,7 @@ pub enum Action {
     Pick,
     /// Held during a dictation: send it through the named prompt.
     Dictate(String),
+    Cancel,
 }
 
 struct Binding {
@@ -193,6 +194,8 @@ fn dispatch(
         Action::Toggle => {
             return fire_on_tap(binding, value, requests, busy, ClientRequest::DictateToggle);
         }
+        // Cancelling is idempotent, and has to reach a busy daemon.
+        Action::Cancel => return !down || requests.send(ClientRequest::Cancel).is_ok(),
         Action::PushToTalk => Key::Talk(down),
         Action::Pick => Key::Pick(down),
         Action::Dictate(prompt) => Key::Dictate(prompt.clone(), down),
@@ -517,6 +520,23 @@ mod tests {
         assert_eq!(gesture.press(t, false), None);
         assert_eq!(gesture.release(ms(t, 1000)), Some(STOP));
         assert_eq!(gesture.release(ms(t, 1000)), None);
+    }
+
+    #[test]
+    fn esc_cancels_on_press_even_while_busy() {
+        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (edges, _) = std_mpsc::channel();
+        let esc = Binding {
+            code: KeyCode::KEY_ESC.code(),
+            action: Action::Cancel,
+            pressed: AtomicBool::new(false),
+        };
+        let busy = AtomicBool::new(true);
+        for value in [1, 2, 0] {
+            assert!(dispatch(&esc, value, &requests, &edges, &busy));
+        }
+        assert_eq!(received.try_recv().ok(), Some(ClientRequest::Cancel));
+        assert!(received.try_recv().is_err());
     }
 
     #[test]

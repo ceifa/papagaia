@@ -407,12 +407,10 @@ impl App {
             (session.recorder, overlay_epoch, to)
         };
 
-        // Transcribe phase: whisper reads the WAV file, no foreign focus needed,
-        // so grab the keyboard exclusively to let the user press Esc to cancel.
         self.overlay
             .send(OverlayMessage::Busy {
                 label: "Transcribing".into(),
-                grab_keyboard: true,
+                grab_keyboard: false,
             })
             .await;
 
@@ -450,7 +448,7 @@ impl App {
                     (prompt, label)
                 }
                 Some(DictationTarget::Picker) => {
-                    // The picker needs the keyboard the HUD is grabbing.
+                    // The picker takes the place of the HUD.
                     self.overlay.send(OverlayMessage::Hidden).await;
                     let Some(prompt) = self.choose_prompt().await? else {
                         clipboard::copy_text(&config.tools, &cleaned, &cancel).await?;

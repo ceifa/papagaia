@@ -120,6 +120,11 @@ fn build_keybinds(config: &Config) -> Vec<(u16, keybinds::Action)> {
             None => eprintln!("papagaia: unrecognized keybind '{key}'; ignoring"),
         }
     }
+    // Esc cancels from here rather than from the overlay, which would have to
+    // take keyboard focus from the app being dictated into to see it.
+    if !bindings.is_empty() {
+        bindings.push((evdev::KeyCode::KEY_ESC.code(), keybinds::Action::Cancel));
+    }
     bindings
 }
 
@@ -185,4 +190,38 @@ async fn handle_connection(app: Arc<App>, stream: UnixStream) -> Result<()> {
         .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bindings_for(keybinds: &str) -> Vec<(u16, keybinds::Action)> {
+        let path = std::env::temp_dir().join(format!(
+            "papagaia-keybinds-{}-{}.toml",
+            std::process::id(),
+            keybinds.len()
+        ));
+        fs::write(
+            &path,
+            format!("[engine]\nargv = [\"cat\"]\n\n[keybinds]\n{keybinds}\n"),
+        )
+        .unwrap();
+        let config = Config::load_from_path(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        build_keybinds(&config)
+    }
+
+    #[test]
+    fn esc_cancels_whenever_a_hotkey_is_bound() {
+        let bindings = bindings_for("push_to_talk = \"RightCtrl\"");
+        assert!(bindings.iter().any(|(code, action)| {
+            *code == evdev::KeyCode::KEY_ESC.code() && *action == keybinds::Action::Cancel
+        }));
+    }
+
+    #[test]
+    fn esc_is_not_watched_without_hotkeys() {
+        assert!(bindings_for("push_to_talk = \"\"").is_empty());
+    }
 }

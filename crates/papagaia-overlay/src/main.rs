@@ -643,12 +643,12 @@ fn apply_message(state: &Rc<UiState>, message: OverlayMessage) {
             if let Some(target) = target {
                 state.message.set_label(&target);
             }
-            // The user is speaking, not typing, so the exclusive grab (for Esc) is safe.
+            // The dictation target keeps focus; the daemon watches Esc itself.
             state
                 .window
-                .set_keyboard_mode(layer_shell::KeyboardMode::Exclusive);
+                .set_keyboard_mode(layer_shell::KeyboardMode::None);
             set_wave_level(&state.wave, level);
-            request_show(state, true);
+            request_show(state, false);
         }
         OverlayMessage::Result { ok, message } => {
             set_state_class(state, if ok { "state-success" } else { "state-error" });
