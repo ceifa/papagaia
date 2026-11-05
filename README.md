@@ -36,36 +36,6 @@ cargo build --release
 
 If systemd setup was skipped, start the daemon manually: `./target/release/papagaia-daemon`
 
-## Performance
-
-The daemon streams WAV uploads through a fixed 64 KiB buffer, so sending a long
-recording does not allocate two additional copies of the audio. Cancelling a
-request closes its connection immediately. The HUD keeps only the latest state,
-updates mic levels at about 30 Hz, and skips repeated CSS changes; disabling it
-also skips its tasks and mic-level calculations. Child commands and the HUD use
-asynchronous process waits instead of dedicated waiting threads.
-
-Local measurements against `cfccef9` (x86_64, Rust 1.94.1, release builds; median
-of three runs with the same benchmark harness):
-
-| Benchmark | Before | After |
-|---|---:|---:|
-| Peak process RSS during a 115.2 MB WAV upload | 223.3 MiB | 3.9 MiB |
-| Upload to a loopback mock server | 52.5 ms | 34.2 ms |
-| 20 commands whose descendants keep stdout/stderr open | 4.071 s | 2.049 s |
-
-These isolate upload and subprocess overhead, excluding microphone capture,
-Whisper model memory/inference, and desktop rendering. The upload fixture is a
-sparse file sized like one hour of 16 kHz mono PCM; recording itself still stores
-audio in memory. Results depend on the machine and filesystem.
-
-Run each benchmark separately so its peak RSS belongs to that scenario:
-
-```bash
-cargo test -p papagaia-daemon --release stt::tests::benchmark_upload -- --exact --ignored --nocapture
-cargo test -p papagaia-daemon --release clipboard::tests::benchmark_inherited_pipes -- --exact --ignored --nocapture
-```
-
 ## Usage
 
 ### Prompts
