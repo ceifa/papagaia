@@ -63,19 +63,6 @@ key, not a CLI command. It's built for speed:
   ("new line"/"nova linha" → break, "period"/"ponto final" → `.`, …), word-repeat collapse,
   whitespace tidy-up, and capitalization. Configure under `[dictation.cleanup]`; filler removal
   is off by default (it can change meaning).
-- **No clipped last word.** Recording runs 200 ms past the key release, and longer (up to
-  600 ms) while you're still mid-word.
-- **Your vocabulary.** List names whisper keeps misspelling under `[whisper].vocabulary`;
-  they're appended to `prompt` and reach whisper through `{{prompt}}`:
-
-  ```toml
-  [whisper]
-  prompt = "Natural spoken dictation with correct punctuation."
-  vocabulary = ["Papagaia", "Wayland", "niri"]
-  ```
-
-  On silence, whisper sometimes just recites its prompt back. A transcript that's only a run of
-  the prompt's words is dropped as "No speech detected".
 
 Short utterances aren't dropped, so quick commands work too. The recording HUD is a small
 bottom-center pill with a live waveform.
@@ -91,7 +78,7 @@ nothing in your compositor. Set them under `[keybinds]`:
 
 ```toml
 [keybinds]
-push_to_talk = "RightCtrl"   # hold to dictate, release to insert; double-tap for hands-free
+push_to_talk = "RightCtrl"   # hold to dictate, release to insert (Wispr Flow's default)
 toggle = ""                  # tap to toggle hands-free dictation
 pick = ""                    # tap to open the prompt picker
 ```
@@ -101,10 +88,6 @@ no hotkey for that action. This needs read access to `/dev/input` — your user 
 `input` group (`papagaia doctor` checks this). Keys are *monitored*, not grabbed, so they still
 pass through to the focused app; pick keys whose passthrough is harmless (a dead key like F13,
 or RightCtrl).
-
-Double-tap `push_to_talk` to dictate hands-free: recording keeps going after the second tap
-and stops at the next press. A single tap waits 300 ms for the second one before
-transcribing.
 
 To put a specific named prompt on a compositor shortcut, you can still bind
 `papagaia prompt run <name>`.
@@ -116,7 +99,7 @@ Config lives at `~/.config/papagaia/config.toml` (run `papagaia config-path` to 
 | Section | Purpose |
 |---|---|
 | `[tools]` | Clipboard read/write and copy/paste key-injection commands |
-| `[whisper]` | STT backend (`cli`/`server`), model path, prompt and vocabulary, warm-server command |
+| `[whisper]` | STT backend (`cli`/`server`), model path, and warm-server command |
 | `[dictation.cleanup]` | Local rule-based transcript cleanup (voice commands, capitalization, …) |
 | `[keybinds]` | Global hotkeys watched via evdev (push_to_talk / toggle / pick) |
 | `[engine]` | LLM CLI for text transformation (the `prompt` commands) |
